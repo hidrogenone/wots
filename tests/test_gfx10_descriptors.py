@@ -37,7 +37,9 @@ def table():
 
 
 def gfx10_name(vulkan):
-    """The GFX10 format name a Vulkan format name implies."""
+    """The GFX10 format name a Vulkan format name implies. An extension's suffix (A8_UNORM_KHR) is not part of the
+    layout."""
+    vulkan = re.sub(r"_(KHR|EXT)$", "", vulkan)
     if vulkan in BY_HAND:
         return BY_HAND[vulkan]
     m = re.fullmatch(r"BC(\d)H?(?:_RGBA?)?_(\w+)_BLOCK", vulkan)
