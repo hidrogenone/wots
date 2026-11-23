@@ -232,6 +232,31 @@ int main(int argc, char** argv) {
               "slot 25 still answers the PC (C++) form");
     }
 
+    constexpr auto kUav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    constexpr auto kDepthStencil = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    constexpr auto kRenderTarget = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const struct {
+        DXGI_FORMAT format;
+        D3D12_RESOURCE_FLAGS input;
+        D3D12_RESOURCE_FLAGS expected;
+        const char* message;
+    } flag_cases[] = {
+        {DXGI_FORMAT_B5G5R5A1_UNORM, kRenderTarget | kUav, kRenderTarget, "B5G5R5A1 keeps only RT"},
+        {DXGI_FORMAT_R32G8X24_TYPELESS, kDepthStencil | kUav, kDepthStencil, "R32G8X24 depth keeps only DS"},
+        {DXGI_FORMAT_R8G8B8A8_UNORM, kRenderTarget | kUav, kRenderTarget | kUav, "RGBA8 keeps RT and UAV"},
+        {DXGI_FORMAT_R32_FLOAT, kUav, kUav, "R32_FLOAT keeps UAV"},
+        {DXGI_FORMAT_R32_TYPELESS, kUav, kUav, "R32_TYPELESS without DS keeps UAV"},
+        {DXGI_FORMAT_D16_UNORM, kDepthStencil | kUav, kDepthStencil, "D16 depth keeps only DS"},
+    };
+    for (const auto& test : flag_cases) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Format = test.format;
+        desc.Flags = test.input;
+        const auto clean = rt::d3d12_xs::pc_resource_desc(desc);
+        check(clean.Flags == test.expected && clean.Format == test.format && desc.Flags == test.input, test.message);
+    }
+
     D3D12_RESOURCE_DESC reserved_desc = buffer_desc();
     reserved_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> reserved;
