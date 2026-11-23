@@ -3219,6 +3219,8 @@ unsigned detect_slot_count(ID3D12Device* real) {
 
 }  // namespace
 
+IUnknown* real_object_behind_proxy(const void* object) { return proxy_real_object(object); }
+
 HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool console_lists) {
     if (!real) return E_POINTER;
     if (!out) return E_POINTER;
