@@ -26,6 +26,9 @@
 //   slot 127  CreateCommittedResource3 (heap, flags, desc1, layout, clear, session, castable count/list, riid, out) ->
 //             PC ID3D12Device10::CreateCommittedResource3 (PC slot 76), with the Xbox layout word replaced and the
 //             Xbox flag bits dropped (RT-5 stop 15, docs/retail_boot_chain.md). E_NOTIMPL when the PC device lacks it.
+//   slot 26   GetCustomHeapProperties, called by the retail title with the C ABI: return buffer in RCX, the device
+//             in RDX (the PC form is `this` in RCX, return buffer in RDX). Slot 25 (GetResourceAllocationInfo, also a
+//             struct wider than 8 bytes) takes the same form by the same rule. Both accept either form.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The 32-byte Xbox desc starts with
 //             a D3D12_COMMAND_QUEUE_DESC; only that prefix is passed on, with the console-only flag bits cleared
 //             (DISABLE_GPU_TIMEOUT is kept). The four extra words are logged once.
@@ -147,9 +150,9 @@ unsigned device_proxy_slot_count(const void* device);
 ID3D12Device* device_proxy_real_device(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 26 (the
+// proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 25/26 (the
 // console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and 78/79/80
-// (the Xbox slots above, at their configured indices), 62, 67, 70, 76, 127 and 133. Slot 10 is intentionally false: the
+// (the Xbox slots above, at their configured indices), 56, 62, 67, 70, 76, 127 and 133. Slot 10 is intentionally false: the
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
