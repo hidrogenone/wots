@@ -147,6 +147,94 @@ void test_apply() {
           "clzero on an unwritable line reports a write access violation at the line");
 }
 
+// The zeroing loop `clzero; add rax, 64; cmp rax, <reg>; jb <the clzero>` is finished in one step once its first
+// CLZERO has been emulated (finish_clzero_loop). `c.Rip` is at the `add`, as apply() leaves it.
+void test_clzero_loop() {
+    constexpr uint64_t cf = 0x1, zf = 0x40;
+    // clzero; add rax,0x40; cmp rax,r10; jb -12; then the same loop with cmp rax,rcx; then one that adds 0x80
+    static const uint8_t code[] = {0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4,
+                                   0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xC8, 0x72, 0xF4,
+                                   0x0F, 0x01, 0xFC, 0x48, 0x05, 0x80, 0x00, 0x00, 0x00, 0x4C, 0x39, 0xD0, 0x72, 0xF2};
+    const uint64_t loop_r10 = reinterpret_cast<uint64_t>(code), loop_rcx = loop_r10 + 12, other = loop_r10 + 24;
+    auto* buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!buf) return check(false, "clzero loop: memory for the test");
+    const uint64_t base = reinterpret_cast<uint64_t>(buf);
+    const auto filled = [&](int line) {
+        for (int i = 0; i < 64; ++i)
+            if (buf[line * 64 + i] != 0xA5) return false;
+        return true;
+    };
+    const auto zero = [&](int line) {
+        for (int i = 0; i < 64; ++i)
+            if (buf[line * 64 + i] != 0) return false;
+        return true;
+    };
+
+    // A limit on a line boundary: lines 1 to 4 are zeroed (line 0 was the emulated CLZERO's), the loop ends equal.
+    std::memset(buf, 0xA5, 8192);
+    CONTEXT c{};
+    c.Rip = loop_r10 + 3;
+    c.Rax = base + 5;
+    c.R10 = base + 5 + 5 * 64;
+    c.EFlags = cf | 0x200;
+    check(ce::finish_clzero_loop(&c, 3) == 4, "clzero loop: four more lines");
+    check(filled(0) && zero(1) && zero(2) && zero(3) && zero(4) && filled(5),
+          "clzero loop: exactly the lines the loop zeroes");
+    check(c.Rax == base + 5 + 5 * 64 && c.Rip == loop_r10 + 12, "clzero loop: rax and rip after the loop");
+    check((c.EFlags & (cf | zf)) == zf && (c.EFlags & 0x200),
+          "clzero loop: equal sets ZF, clears CF, keeps the other flags");
+
+    // A limit inside a line: the loop runs while rax is below it, and ends above with no flag of the two.
+    std::memset(buf, 0xA5, 8192);
+    c = {};
+    c.Rip = loop_r10 + 3;
+    c.Rax = base;
+    c.R10 = base + 3 * 64 + 1;
+    check(ce::finish_clzero_loop(&c, 3) == 3 && zero(1) && zero(2) && zero(3) && filled(4),
+          "clzero loop: a limit inside a line");
+    check(c.Rax == base + 4 * 64 && !(c.EFlags & (cf | zf)) && c.Rip == loop_r10 + 12,
+          "clzero loop: ends above the limit");
+
+    // The compare can name any register: cmp rax, rcx.
+    std::memset(buf, 0xA5, 8192);
+    c = {};
+    c.Rip = loop_rcx + 3;
+    c.Rax = base;
+    c.Rcx = base + 2 * 64;
+    c.R10 = base + 100 * 64;  // not the limit here
+    check(ce::finish_clzero_loop(&c, 3) == 1 && zero(1) && filled(2) && c.Rip == loop_rcx + 12,
+          "clzero loop: cmp rax, rcx");
+
+    // Nothing left to do, and code that is not this loop: the context is not touched.
+    std::memset(buf, 0xA5, 8192);
+    c = {};
+    c.Rip = loop_r10 + 3;
+    c.Rax = base;
+    c.R10 = base + 64;
+    check(ce::finish_clzero_loop(&c, 3) == 0 && c.Rax == base && c.Rip == loop_r10 + 3 && filled(1),
+          "clzero loop: the emulated CLZERO was the last iteration");
+    c.Rip = other + 3;
+    c.R10 = base + 10 * 64;
+    check(ce::finish_clzero_loop(&c, 3) == 0 && c.Rax == base && c.Rip == other + 3 && filled(1),
+          "clzero loop: another instruction after the CLZERO is left alone");
+    c.Rip = loop_r10 + 3;
+    check(ce::finish_clzero_loop(&c, 4) == 0 && filled(1),
+          "clzero loop: the branch must go back to the CLZERO's first byte");
+
+    // A page that cannot be written ends it: the lines before it are zeroed and that iteration's CLZERO runs next.
+    std::memset(buf, 0xA5, 8192);
+    DWORD old = 0;
+    VirtualProtect(buf + 4096, 4096, PAGE_READONLY, &old);
+    c = {};
+    c.Rip = loop_r10 + 3;
+    c.Rax = base + 4096 - 3 * 64;
+    c.R10 = base + 8192;
+    check(ce::finish_clzero_loop(&c, 3) == 2 && zero(62) && zero(63) && filled(64),
+          "clzero loop: stops at a read-only page");
+    check(c.Rax == base + 4096 && c.Rip == loop_r10, "clzero loop: the next CLZERO is the one that faults");
+    VirtualFree(buf, 0, MEM_RELEASE);
+}
+
 // ---- Running the real encodings ----
 
 using Fn = void (*)(const void* in, void* out);
@@ -229,6 +317,33 @@ void test_live(const ce::Host& host) {
     check(ok, "clzero zeroed one line");
     std::printf("clzero: %s\n", path(host.clzero));
 
+    // The loop the executable zeroes memory with: mov rax,rcx; mov r10,rdx; clzero; add rax,0x40; cmp rax,r10;
+    // jb the clzero; ret. Native on a host with CLZERO; emulated, its first CLZERO finishes the loop in one trap.
+    Code loop({0x48, 0x89, 0xC8, 0x49, 0x89, 0xD2, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72,
+               0xF4, 0xC3});
+    if (auto* big = static_cast<uint8_t*>(VirtualAlloc(nullptr, 1 << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+        std::memset(big, 0x5A, 1 << 20);
+        const std::size_t first = 64 * 3, end = (1 << 20) - 64 * 5;  // lines 3 up to the last five
+        LARGE_INTEGER frequency, before, after;
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&before);
+        check(run(loop, big + first + 9, big + end, &ex), "clzero loop ran");
+        QueryPerformanceCounter(&after);
+        std::printf("clzero loop: %zu lines in %.3f ms (%s)\n", (end - first) / 64,
+                    1000.0 * double(after.QuadPart - before.QuadPart) / double(frequency.QuadPart), path(host.clzero));
+        bool loop_ok = true;
+        for (std::size_t i = 0; i < (1 << 20); ++i) loop_ok &= big[i] == ((i >= first && i < end) ? 0 : 0x5A);
+        check(loop_ok, "clzero loop zeroed its range and nothing else");
+        // Across a read-only page the loop faults there, with the lines before it zeroed.
+        std::memset(big, 0x5A, 1 << 20);
+        DWORD old = 0;
+        VirtualProtect(big + 8192, 4096, PAGE_READONLY, &old);
+        check(!run(loop, big, big + 16384, &ex) && ex == STATUS_ACCESS_VIOLATION,
+              "clzero loop into a read-only page raises an access violation");
+        check(big[0] == 0 && big[8191] == 0 && big[8192] == 0x5A, "clzero loop zeroed up to the read-only page");
+        VirtualFree(big, 0, MEM_RELEASE);
+    }
+
     // A read-only line: the CPU and the handler both raise a write access violation, not #UD.
     if (auto* ro = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
         DWORD old = 0;
@@ -268,6 +383,7 @@ int main() {
     test_decode();
     test_bits();
     test_apply();
+    test_clzero_loop();
     const ce::Host host = ce::detect_host();
     std::printf("host: SSE4a %d, MONITORX %d, CLZERO %d, CLWB %d\n", host.sse4a, host.monitorx, host.clzero,
                 host.clwb);

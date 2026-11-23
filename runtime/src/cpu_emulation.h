@@ -272,6 +272,68 @@ inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullpt
     return true;
 }
 
+// The executable zeroes memory with the loop `clzero; add rax, 64; cmp rax, <reg>; jb <the clzero>`. Emulated one
+// instruction at a time, that is one #UD round trip (about 2 us) for every 64 bytes, and a loop over megabytes takes
+// seconds: measured on a retail boot, the title's frame loop ran at 2 to 3 frames a second on a CPU without CLZERO
+// (docs/cpu_features.md). So when a CLZERO has just been emulated and RIP is at exactly that tail, the rest of the
+// loop is done here: every further line it would zero is zeroed, RAX gets the value the loop leaves, the arithmetic
+// flags are those of its last compare, and RIP is after the branch. A line that cannot be written ends it early with
+// RIP back at the CLZERO and RAX in that line, so that iteration traps again and raises its fault as before.
+// `clzero_length` is the length of the CLZERO just emulated (the branch must go back to its first byte). Returns the
+// number of lines zeroed; 0 leaves `c` untouched (another tail, or no iteration left to run).
+inline uint64_t finish_clzero_loop(CONTEXT* c, std::size_t clzero_length) {
+    constexpr std::size_t tail = 9;  // add rax, 0x40 (4 bytes) + cmp rax, r64 (3) + jb rel8 (2)
+    if (readable(c->Rip, tail) < tail) return 0;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(c->Rip);
+    if (p[0] != 0x48 || p[1] != 0x83 || p[2] != 0xC0 || p[3] != 0x40) return 0;             // add rax, 0x40
+    if ((p[4] != 0x48 && p[4] != 0x4C) || p[5] != 0x39 || (p[6] & 0xC7) != 0xC0) return 0;  // cmp rax, r64
+    if (p[7] != 0x72 || int8_t(p[8]) != -int(tail + clzero_length)) return 0;               // jb to the CLZERO
+    const unsigned reg = ((p[6] >> 3) & 7u) | (p[4] == 0x4C ? 8u : 0u);
+    if (reg == 0) return 0;  // cmp rax, rax: never below
+    const uint64_t limit = (&c->Rax)[reg];  // CONTEXT holds RAX..R15 in encoding order
+    uint64_t rax = c->Rax + 64;
+    uint64_t lines = 0;
+    while (rax < limit) {
+        const uint64_t line = rax & ~uint64_t(63);
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(reinterpret_cast<void*>(line), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & PAGE_GUARD))
+            break;
+        const DWORD protect = mbi.Protect & 0xFF;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
+            protect != PAGE_EXECUTE_WRITECOPY)
+            break;
+        const uint64_t region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+        const uint64_t wanted = (limit - rax + 63) / 64;  // iterations until rax is not below the limit
+        const uint64_t fit = (region_end - line) / 64;    // lines left in this region
+        const uint64_t n = wanted < fit ? wanted : fit;
+        if (!n) break;
+        std::memset(reinterpret_cast<void*>(line), 0, std::size_t(n * 64));
+        rax += n * 64;
+        lines += n;
+    }
+    if (!lines) return 0;
+    c->Rax = rax;
+    if (rax < limit) {  // a line that cannot be written: that iteration's CLZERO runs next and raises the fault
+        c->Rip -= clzero_length;
+        return lines;
+    }
+    const uint64_t result = rax - limit;      // the last `cmp rax, limit`: not below, so no carry
+    DWORD flags = c->EFlags & ~DWORD(0x8D5);  // CF, PF, AF, ZF, SF, OF
+    uint8_t low = uint8_t(result);
+    low ^= low >> 4;
+    low ^= low >> 2;
+    low ^= low >> 1;
+    if (!(low & 1)) flags |= 0x4;                                // PF: even parity of the low byte
+    if ((rax ^ limit ^ result) & 0x10) flags |= 0x10;            // AF
+    if (!result) flags |= 0x40;                                  // ZF
+    if (result >> 63) flags |= 0x80;                             // SF
+    if (((rax ^ limit) & (rax ^ result)) >> 63) flags |= 0x800;  // OF
+    c->EFlags = flags;
+    c->Rip += tail;
+    return lines;
+}
+
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = info->ContextRecord;
@@ -295,6 +357,10 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (count(d.op).fetch_add(1, std::memory_order_relaxed) == 0)
         std::fprintf(stderr, "[rt] cpu: this CPU has no %s; emulating it (first at %p)\n", name(d.op),
                      reinterpret_cast<void*>(c->Rip - d.length));
+    if (d.op == Op::clzero) {
+        const uint64_t more = finish_clzero_loop(c, d.length);
+        if (more) count(d.op).fetch_add(more, std::memory_order_relaxed);
+    }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 

@@ -61,4 +61,37 @@ in the image.
 - The CPUID sites see the host's vendor, family and features, not the console's. What the game does with the
   answers is not measured here.
 
+## The zeroing loop
+
+The 10 CLZERO sites are one routine that zeroes memory a cache line at a time, each with the same four instructions:
+
+```
+clzero                ; zero the line rax points into
+add  rax, 64
+cmp  rax, <register>  ; the end of the range
+jb   <the clzero>
+```
+
+Emulated one instruction at a time, that is one `#UD` round trip for every 64 bytes. `cpu_emulation_test` times the
+loop over 1 MiB (16,376 lines) on an i9-14900KF, which has no CLZERO: **31.8 ms**, about 1.9 us a line.
+
+A boot reaches this loop, and its frame loop runs it all the time. Measured on a retail boot (own 1.0.2.1 copy,
+i9-14900KF, RTX 5070, Windows 11, `LEONIDA_D3D12=vulkan`, `main` with the open boot-chain pull requests merged
+locally up to a steady frame loop that presents): one title thread was at 100 % of a core and 4 of 24 stack samples
+found it on the CLZERO itself; the title presented about **2.4 frames a second** (167 frames in 68 s).
+
+So the handler finishes the loop in the trap of its first CLZERO (`finish_clzero_loop` in
+`runtime/src/cpu_emulation.h`). When the bytes after an emulated CLZERO are exactly that tail, it zeroes every further
+line the loop would, leaves RAX, the arithmetic flags and RIP as the loop does, and continues after the branch. A line
+that cannot be written ends it early, with RIP back at the CLZERO and RAX in that line, so that iteration traps again
+and raises its access violation as the instruction does. Any other code after a CLZERO is emulated as before.
+
+| | Before | After |
+|---|---:|---:|
+| 1 MiB loop in `cpu_emulation_test` | 31.8 ms | 0.02 to 0.04 ms |
+| Retail frame loop, frames presented a second | about 2.4 | about 46 (6,000 in 129 s) |
+
+The first loop the boot ran through it zeroed 229 lines in one trap. This does not change what the title draws: the
+frames were black before and after.
+
 Not measured: which of these sites a boot reaches, and in which order.
