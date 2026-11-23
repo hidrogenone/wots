@@ -64,6 +64,19 @@ The process shim (`runtime/shims/process.cpp`) serves `ExitProcess` and `GetComm
 
 The shims added since account for the rest of the difference from the first version of the table. The UCRT's `_configure_narrow_argv`, `_configure_wide_argv`, `__p___argc`, `__p___wargv` and `abort` are served by `runtime/shims/process.cpp`, which is why almost every DLL gained one or two. The file-system calls listed in *Console paths and the write overlay* below (`CreateFile2`, `CopyFile2`, `CreateDirectoryW`, `FindFirstFileExW`, `SetFileAttributesW` and the rest) account for `msvcp140.dll`, `vcomp140.dll`, `Bink2Scarlett.dll`'s `CreateFile2` and part of the two HTTP clients. `winhttp.dll` is a module the shims own (*WinHTTP offline* below), so every `WinHttp*` import binds to it: 15 in `libHttpClient.GDK.dll` (all 16 but `WinHttpCrackUrl`) and 15 in `XCurl.dll` (all but `WinHttpQueryOption`). That is why the two HTTP clients moved the most: 11 to 26 and 9 to 24 shim imports.
 
+The UCRT argv configuration imports honor the executable's startup mode. Each run starts with `argc == 0` and
+null narrow/wide argument tables, while `GetCommandLineA/W` is already available to TLS and process-attach
+callbacks. Default startup publishes unexpanded arguments for its chosen width. `setargv.obj` / `wsetargv.obj`
+startup expands wildcard arguments against the host working directory, including quoted patterns; an unmatched
+pattern stays literal. Narrow expansion searches the ACP-converted pattern and converts matching names back to
+ACP, so its matches can differ from wide startup. The two widths retain independent tables, and the most recently
+configured width sets the shared `argc`. `noarg.obj` leaves the initial tables null; later no-argument
+configuration is a no-op that preserves existing pointers and counts. These are guest-owned tables, without
+changing the host CRT's argument globals. This does not add console-path wildcard routing or change the legacy
+`msvcrt!__getmainargs` wildcard policy. `run_argv_modes` compares the same six linker-selected MSVC fixtures
+natively and through the loader; `run_startup_cmdline` also checks native preconfiguration and command-line
+identity through attach and entry.
+
 The six unique Xbox-specific imports (eight consumer/import pairs) are exactly the set recorded in
 [`d3d12_vulkan.md` §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi):
 
@@ -89,6 +102,27 @@ bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))`
 2 MiB, to move budget from the title's memory partition to the system's. A PC has no such partition, so the shim
 returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
 and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
+
+Seven more `xmem.dll` imports follow argument shapes measured locally at a title's call sites (the comments in
+`runtime/shims/xmem.cpp` give each shape):
+
+- `XMemAllocDefault` and `XMemFreeDefault` take `XMemAlloc`'s and `XMemFree`'s arguments and share their heap.
+- `XMemAllocatePhysicalPages(attributes, UINT64* count, UINT64* pages)` returns a `BOOL` and the count it allocated.
+  Each call is one pagefile-backed section of `count` 64 KiB pages. A page number is a 4 KiB frame number: a
+  non-zero multiple of 16 below 2^25, which is what the measured title assumes when it packs them. `0` means "unmap".
+- `XMemMapPhysicalPages(address, UINT64 count, pages)` returns the address. A null page array unmaps.
+  `XMemMapPhysicalPagesScatter(addresses, UINT32 count, pages)` returns a `BOOL`, and a `0` entry unmaps.
+  `XMemFreePhysicalPages(UINT64 count, pages)` returns a `BOOL`. Every page is its own view, mapped with
+  `MapViewOfFile3` into a 64 KiB placeholder, so a page keeps its contents across remaps and can be mapped twice.
+- The windows are reserve-only 64 KiB-page `XMemVirtualAlloc` regions. The shim reserves them as placeholders and
+  keeps their protection, which mapped pages get (AWE's rule). The measured title also reserves a placeholder with
+  `MEM_RESERVE_PLACEHOLDER` and carves windows out of it with `MEM_REPLACE_PLACEHOLDER`, and the shim passes both
+  through. **ASSUMPTION:** nothing commits into a window with `kernel32!VirtualAlloc`, which a placeholder refuses.
+- `XMemVirtualAlloc` used to refuse 2 MiB pages, and five of the 23 measured calls commit them. They are now
+  committed 2 MiB-aligned through `VirtualAlloc2`. The attribute word is recorded (`xmem_attributes`) and the
+  console's `PAGE_GRAPHICS_*` bits are dropped from the protection, as before.
+- `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
+  on an out-of-memory path, after an allocation has already failed.
 
 ## The retail executable (RT-5)
 
@@ -131,6 +165,8 @@ Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.d
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
 `xapu.dll`, `AcpHal.dll`) with no shim at all.
 
+The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
+
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
 again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
@@ -143,39 +179,6 @@ that name exists), and an unimplemented import stops the run only if the title c
 functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
 host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
 which opens none.
-
-### Physical pages
-
-Those reserve-only 64 KiB-page ranges are where the title maps physical pages. The executable imports
-`XMemAllocatePhysicalPages`, `XMemFreePhysicalPages`, `XMemMapPhysicalPages` and `XMemMapPhysicalPagesScatter`, and
-asserts at startup when the first allocation fails. Its call sites show the Win32 AWE shapes without the process
-handle, plus an attribute word (`0x180`, `0x280` and `0x380` measured):
-
-| Export | Shape | What the callers check |
-|---|---|---|
-| `XMemAllocatePhysicalPages` | `BOOL (ULONG64 attributes, ULONG_PTR* count, ULONG_PTR* page_array)`, count in 64 KiB pages | `TRUE`, and the count written back unchanged |
-| `XMemFreePhysicalPages` | `BOOL (ULONG_PTR count, ULONG_PTR* page_array)`, count by value | nothing |
-| `XMemMapPhysicalPages` | `PVOID (PVOID va, ULONG_PTR count, ULONG_PTR* page_array)`; a null array unmaps | non-null (64-bit test) |
-| `XMemMapPhysicalPagesScatter` | `BOOL (PVOID* va_array, ULONG_PTR count, ULONG_PTR* page_array)`; null array or 0 entries unmap | nothing |
-
-A page-array entry is opaque to the title except at one call site, which rebuilds it as a 64 KiB page index times 16,
-masked to 25 bits. The shim's entries are therefore 4 KiB frame numbers of 64 KiB pages, `(slot + 1) * 16`.
-
-The host only has user-mode physical pages through AWE, which needs `SeLockMemoryPrivilege` and cannot map one page
-at two addresses. The console can, and the title's two 24 GiB reservations differ only in their attribute word and CPU
-protection. So `runtime/shims/xmem_physical.cpp` makes each page a 64 KiB slot of a pagefile-backed section. A
-reserve-only `MEM_RESERVE | 0x20400000` range is a placeholder reservation (`VirtualAlloc2` with
-`MEM_RESERVE_PLACEHOLDER`). Mapping a page splits it out and replaces it with a view of the slot (`MapViewOfFile3` with
-`MEM_REPLACE_PLACEHOLDER`), and unmapping puts the placeholder back. Every view of a page sees the same bytes and has
-its range's CPU protection; the `PAGE_GRAPHICS_*` bits are dropped. New pages read as zero, and a freed page is zeroed
-before it is handed out again. Freeing a page unmaps it everywhere, as `FreeUserPhysicalPages` does. The title's
-`VirtualFree(base, 0, MEM_RELEASE)` of such a range is shimmed, because the host's would release only its first
-placeholder.
-
-Not done: the GPU side (the D3D12 layer does not see these pages yet; [#5381](https://github.com/ItsNotRexed/Leonida/pull/5381)
-has a device-local half for the same mechanism), and committing ordinary memory inside a physical range, which fails
-with `ERROR_INVALID_ADDRESS` as on Win32. Each mapped page is a view of its own, so a large mapping is many views.
-`xmem_physical_test` covers the shapes above with synthetic pages.
 
 ## Console paths and the write overlay
 
@@ -245,44 +248,6 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   move of one.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
-
-## Console page sizes
-
-A title asks for the console's page sizes in the allocation type of `xmem.dll!XMemVirtualAlloc` and of its own
-`VirtualAlloc` (the `kernel32.dll`, `kernelbase.dll` and `api-ms-win-core-memory-l1-1-*` imports
-`runtime/shims/xmem.cpp` serves):
-
-| Allocation-type bits | Page size |
-|---|---|
-| `MEM_LARGE_PAGES \| MEM_PHYSICAL` (`0x20400000`) | 64 KiB |
-| `MEM_LARGE_PAGES` (`0x20000000`) | 2 MiB |
-| `MEM_4MB_PAGES` (`0x80000000`), with or without `MEM_LARGE_PAGES` | 4 MiB |
-
-The host reads the same bits differently: its `MEM_LARGE_PAGES` needs `SeLockMemoryPrivilege`, which a player's
-account does not hold, and it rejects `MEM_4MB_PAGES`. The values are the GDK names as other layers read them
-(OpenScarlett `include/openscarlett/kernel/kernelx_abi.h`, xbox-emulator `crates/compat/xmem/src/virt.rs`). The
-shim never forwards these bits. It serves every page size from ordinary host pages and keeps what a title can see
-of it:
-
-- a new region's base is a multiple of the page size (`VirtualAlloc2` with an alignment requirement; where that is
-  missing or refuses the parameter, a reserve-release-reserve probe that retries when another thread takes the
-  range);
-- the size is rounded up to whole pages, and an address given with the page-size bits is rounded out to the pages
-  it touches, so a commit with `MEM_LARGE_PAGES` inside a 2 MiB reservation commits that whole 2 MiB page;
-- each new region is one host allocation, so `VirtualFree(base, 0, MEM_RELEASE)` and `VirtualQuery` report the
-  base and the rounded size the title was given.
-
-`XMemVirtualAlloc` with no operation bit reserves and commits; a title's `VirtualAlloc` with a page-size bit still
-needs `MEM_RESERVE` or `MEM_COMMIT`, as on Win32. Any other combination of these bits (`0x00400000` alone with
-`XMemVirtualAlloc`, `MEM_4MB_PAGES` with `MEM_PHYSICAL`) fails with `ERROR_INVALID_PARAMETER`; the
-`XMemVirtualAlloc` attribute word is recorded, not applied. A title's `VirtualAlloc` with
-`MEM_PHYSICAL` and no page-size bit goes to the host unchanged. Not covered: the page size is taken from each call's
-bits, not remembered per region, so a commit without them inside a 2 MiB reservation commits host pages only; the
-host still pages 4 KiB at a time (only TLB timing could tell); and no shim serves the physical-page calls
-(`XMemAllocatePhysicalPages` and the mapping functions), which take the same bits. `xmem_test` checks every page
-size through `XMemVirtualAlloc` (alignment, rounding, commit inside a reservation, release, the rejected
-combinations) and through a title's `VirtualAlloc` (alignment, rounding, release, the operation rule); `xmem_probe`
-runs it again with `LEONIDA_XMEM_NO_VIRTUALALLOC2` set, to cover the probe fallback.
 
 ## When an unimplemented import is called
 

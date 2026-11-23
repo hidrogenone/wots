@@ -3,10 +3,11 @@
 // Every function is resolved through rt::shims::find, so the test exercises the same shim table and calling
 // convention the runtime installs for xmem.dll imports instead of a private copy of the implementation. The checks
 // cover what the measured call sites use: 64-byte-aligned allocations, XMemFree, working-set statistics with the
-// size at +8, and XMemVirtualQuery's MEMORY_BASIC_INFORMATION prefix inside a zeroed 64-byte output, plus the
-// console's 64 KiB, 2 MiB and 4 MiB page modes in XMemVirtualAlloc and a title's VirtualAlloc.
+// size at +8, and XMemVirtualQuery's MEMORY_BASIC_INFORMATION prefix inside a zeroed 64-byte output.
 // XMemTransferMemory follows the call shape in Microsoft's public samples: TRUE for any direction and size, with
-// nothing committed, and one trace event per distinct (type, size).
+// nothing committed, and one trace event per distinct (type, size). XMemVirtualAlloc accepts attribute words and console
+// graphics protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
+// contents across unmap and remap, alias when mapped twice, and scatter-map per address.
 #include <windows.h>
 #include <psapi.h>
 
@@ -34,7 +35,17 @@ using XMemResetWriteWatchFn = UINT(WINAPI*)(void*, SIZE_T);
 // BOOL XMemTransferMemory(XMEM_TRANSFER_TYPE, SIZE_T): the shape Microsoft's public NetRumble and NativeAOT-Xbox
 // samples call (see runtime/shims/xmem.cpp).
 using XMemTransferMemoryFn = BOOL(WINAPI*)(uint32_t, SIZE_T);
+// The shapes measured at a title's call sites (see runtime/shims/xmem.cpp).
+using XMemIsToolsMemAvailableFn = BOOL(WINAPI*)();
+using XMemAllocatePhysicalPagesFn = BOOL(WINAPI*)(uint64_t, uint64_t*, uint64_t*);
+using XMemFreePhysicalPagesFn = BOOL(WINAPI*)(uint64_t, const uint64_t*);
+using XMemMapPhysicalPagesFn = void*(WINAPI*)(void*, uint64_t, const uint64_t*);
+using XMemMapPhysicalPagesScatterFn = BOOL(WINAPI*)(void* const*, uint32_t, const uint64_t*);
 constexpr uint32_t kMeasuredKind = 0x20000001;
+constexpr DWORD kXmemLargePages = 0x20000000;
+constexpr DWORD kXmem64kPages = 0x20400000;
+constexpr SIZE_T kPage64k = 0x10000;
+constexpr SIZE_T kPage2m = 0x200000;
 
 int g_checks = 0;
 int g_failures = 0;
@@ -219,7 +230,34 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
 
     check(VirtualFree(base, 0, MEM_RELEASE), "release the synthetic write-watch region");
 
-    SetLastError(ERROR_SUCCESS);
+    // 2 MiB guest pages: the region is 2 MiB-aligned, rounded up to whole 2 MiB pages and committed.
+    void* const large_page = virtual_alloc(nullptr, kPage2m + page_size, MEM_RESERVE | MEM_COMMIT | kXmemLargePages,
+                                           0x183, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE | PAGE_GRAPHICS_COHERENT);
+    check(large_page != nullptr, "XMemVirtualAlloc commits 2 MiB guest pages");
+    if (large_page) {
+        check((reinterpret_cast<uintptr_t>(large_page) & (kPage2m - 1)) == 0, "a 2 MiB-page region is 2 MiB-aligned");
+        MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(large_page, &info, sizeof(info));
+        check(info.State == MEM_COMMIT && info.RegionSize >= 2 * kPage2m && info.Protect == PAGE_READWRITE,
+              "a 2 MiB-page region is rounded up to whole pages, committed read-write without the graphics bits");
+        static_cast<volatile uint8_t*>(large_page)[2 * kPage2m - 1] = 0x77;
+        check(VirtualFree(large_page, 0, MEM_RELEASE), "release the 2 MiB-page region");
+    }
+
+    // The attribute word is accepted (every measured call passes a nonzero one) and the protection loses its graphics
+    // bits, in the 64 KiB page mode as well.
+    void* const attributed = virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT | kXmem64kPages, 0x181,
+                                           PAGE_READWRITE | PAGE_GRAPHICS_READWRITE);
+    check(attributed != nullptr, "XMemVirtualAlloc accepts a nonzero attribute word and console protection bits");
+    if (attributed) {
+        MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(attributed, &info, sizeof(info));
+        check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
+              "the region is committed PAGE_READWRITE (graphics bits dropped)");
+        static_cast<volatile uint8_t*>(attributed)[0] = 0x42;
+        check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed region");
+    }
+
     // The retail executable's GPU pools: the attribute word is recorded, and the PAGE_GRAPHICS_* bits are dropped.
     MEMORY_BASIC_INFORMATION mbi{};
     void* const pool = virtual_alloc(nullptr, SIZE_T{8} << 30, MEM_RESERVE | 0x20400000, 0x21, PAGE_READWRITE);
@@ -245,6 +283,195 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
         check(static_cast<volatile uint8_t*>(gpu)[0] == 0x5a, "the 0x183 allocation is writable");
         check(VirtualFree(gpu, 0, MEM_RELEASE), "release the 0x183 allocation");
     }
+
+    SetLastError(ERROR_SUCCESS);
+    void* const replace_without_address =
+        virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0, PAGE_READWRITE);
+    check(replace_without_address == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "MEM_REPLACE_PLACEHOLDER without an address is rejected");
+}
+
+// XMemAllocDefault / XMemFreeDefault share XMemAlloc's heap: a block from either is freed by either.
+void test_default_alloc(XMemAllocFn alloc, XMemFreeFn free_mem, XMemAllocFn alloc_default,
+                        XMemFreeFn free_default) {
+    void* const a = alloc_default(100, 0x5e50000);
+    check(aligned_64(a), "XMemAllocDefault returns a 64-byte aligned block");
+    void* const zero = alloc_default(0, 0);
+    check(zero != nullptr, "XMemAllocDefault(0) returns non-null");
+    void* const b = alloc(100, 0);
+    if (a) std::memset(a, 0x11, 100);
+    if (b) std::memset(b, 0x22, 100);
+    free_mem(a, 0x5e50000);
+    free_default(b, 0);
+    free_default(zero, 0);
+    check(true, "XMemFree releases an XMemAllocDefault block and XMemFreeDefault an XMemAlloc block");
+}
+
+uint32_t read_u32(const void* base, size_t offset) {
+    uint32_t value = 0;
+    std::memcpy(&value, static_cast<const uint8_t*>(base) + offset, sizeof(value));
+    return value;
+}
+
+void fill_page(void* page, uint32_t tag) {
+    auto* words = static_cast<uint32_t*>(page);
+    for (size_t i = 0; i < kPage64k / sizeof(uint32_t); i += 1024) words[i] = tag + static_cast<uint32_t>(i);
+}
+
+bool page_holds(const void* page, uint32_t tag) {
+    for (size_t i = 0; i < kPage64k / sizeof(uint32_t); i += 1024) {
+        if (read_u32(page, i * sizeof(uint32_t)) != tag + static_cast<uint32_t>(i)) return false;
+    }
+    return true;
+}
+
+bool reserved_only(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(address, &info, sizeof(info)) && info.State == MEM_RESERVE;
+}
+
+struct PhysicalApi {
+    XMemVirtualAllocFn virtual_alloc;
+    XMemAllocatePhysicalPagesFn allocate;
+    XMemFreePhysicalPagesFn free_pages;
+    XMemMapPhysicalPagesFn map;
+    XMemMapPhysicalPagesScatterFn scatter;
+};
+
+// Physical pages in a 64 KiB-page window, as the measured callers use them: reserve a window, allocate pages, map them,
+// remap them elsewhere and in another order, unmap, free.
+void test_physical_pages(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 4;
+    auto* const window = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
+    check(window != nullptr, "XMemVirtualAlloc reserves a 64 KiB-page window");
+    auto* const second = static_cast<uint8_t*>(api.virtual_alloc(
+        nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(second != nullptr, "XMemVirtualAlloc reserves a second window");
+    if (!window || !second) return;
+    check(reserved_only(window), "the window is reserved, not committed");
+
+    uint64_t pages[kPages]{};
+    uint64_t count = kPages;
+    check(api.allocate(0x280, &count, pages) == TRUE && count == kPages,
+          "XMemAllocatePhysicalPages allocates every page asked for and keeps the count");
+    bool numbers_ok = true;
+    for (uint64_t i = 0; i < kPages; ++i) {
+        numbers_ok &= pages[i] != 0 && pages[i] % 16 == 0 && pages[i] < (uint64_t{1} << 25);
+        for (uint64_t j = 0; j < i; ++j) numbers_ok &= pages[i] != pages[j];
+    }
+    check(numbers_ok, "page numbers are distinct non-zero multiples of 16 below 2^25");
+
+    check(api.map(window, kPages, pages) == window, "XMemMapPhysicalPages returns the address it mapped");
+    for (uint64_t i = 0; i < kPages; ++i) fill_page(window + i * kPage64k, 0x1000u * static_cast<uint32_t>(i + 1));
+    {
+        MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(window, &info, sizeof(info));
+        check(info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READWRITE,
+              "a mapped page is a read-write view with the window's protection");
+    }
+
+    check(api.map(window, kPages, nullptr) == window, "XMemMapPhysicalPages with no page array unmaps");
+    check(reserved_only(window) && reserved_only(window + 3 * kPage64k), "unmapped pages are reserved again");
+
+    // Remap in reverse order into the other window: each page keeps its contents.
+    uint64_t reversed[kPages];
+    for (uint64_t i = 0; i < kPages; ++i) reversed[i] = pages[kPages - 1 - i];
+    check(api.map(second, kPages, reversed) == second, "the pages map into another window");
+    bool kept = true;
+    for (uint64_t i = 0; i < kPages; ++i) {
+        kept &= page_holds(second + i * kPage64k, 0x1000u * static_cast<uint32_t>(kPages - i));
+    }
+    check(kept, "a physical page keeps its contents across unmap and remap");
+
+    // One page mapped at two addresses is one memory.
+    check(api.map(window, 1, &pages[0]) == window, "a page already mapped elsewhere maps again");
+    static_cast<volatile uint32_t*>(static_cast<void*>(window))[1] = 0xfeedf00d;
+    check(read_u32(second + 3 * kPage64k, 4) == 0xfeedf00d, "both mappings of a page see the same memory");
+
+    // Mapping over a mapped page replaces it; a 0 entry unmaps one page.
+    const uint64_t replace[2] = {pages[1], 0};
+    check(api.map(window, 2, replace) == window, "mapping over mapped pages replaces them");
+    check(page_holds(window, 0x2000u) && reserved_only(window + kPage64k),
+          "the first page now shows page 1 and a 0 entry left the second unmapped");
+
+    // Scatter: entry i maps page i at address i, out of order; 0 unmaps.
+    void* const addresses[3] = {window + 3 * kPage64k, window + 2 * kPage64k, window};
+    const uint64_t scattered[3] = {pages[2], pages[3], 0};
+    check(api.scatter(addresses, 3, scattered) == TRUE, "XMemMapPhysicalPagesScatter maps each page at its address");
+    check(page_holds(window + 3 * kPage64k, 0x3000u) && page_holds(window + 2 * kPage64k, 0x4000u) &&
+              reserved_only(window),
+          "scattered pages land at their own addresses and a 0 entry unmaps");
+    check(api.scatter(addresses, 3, nullptr) == TRUE && reserved_only(window + 3 * kPage64k),
+          "XMemMapPhysicalPagesScatter with no page array unmaps");
+
+    uint8_t outside = 0;
+    SetLastError(ERROR_SUCCESS);
+    check(api.map(reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(&outside) + 0xffff) & ~uintptr_t{0xffff}), 1,
+                  pages) == nullptr,
+          "mapping outside any window fails");
+    check(api.map(window + 1, 1, pages) == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+          "mapping at an address that is not 64 KiB-aligned fails");
+    const uint64_t bogus = 0x1fffff0;  // the highest page number, far above the few this test allocates
+    check(api.map(window, 1, &bogus) == nullptr, "mapping a page number that was never allocated fails");
+
+    check(api.map(second, kPages, nullptr) == second, "unmap the second window");
+    check(api.free_pages(kPages, pages) == TRUE, "XMemFreePhysicalPages frees the pages");
+    check(api.free_pages(1, pages) == FALSE, "freeing a page twice fails");
+
+    // Freed numbers are reused.
+    uint64_t again[kPages]{};
+    count = kPages;
+    check(api.allocate(0x180, &count, again) == TRUE && count == kPages, "pages can be allocated again");
+    bool reused = true;
+    for (uint64_t i = 0; i < kPages; ++i) {
+        bool found = false;
+        for (uint64_t j = 0; j < kPages; ++j) found |= again[i] == pages[j];
+        reused &= found;
+    }
+    check(reused, "freed page numbers are reused");
+    check(api.map(window, 1, again) == window && read_u32(window, 0) == 0, "a fresh page maps and reads as zero");
+    api.map(window, 1, nullptr);
+    api.free_pages(kPages, again);
+
+    uint64_t zero_count = 0;
+    check(api.allocate(0x280, &zero_count, nullptr) == TRUE, "allocating zero pages succeeds");
+    check(api.allocate(0x280, nullptr, pages) == FALSE, "a null count fails");
+    // The windows were split into one placeholder per page; the process exit releases them.
+}
+
+// The placeholder flags pass through: reserve a placeholder, carve windows and committed memory out of it.
+void test_placeholders(const PhysicalApi& api) {
+    auto* const base = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 6 * kPage64k, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));
+    check(base != nullptr, "XMemVirtualAlloc reserves a MEM_RESERVE_PLACEHOLDER region");
+    if (!base) return;
+
+    void* const window = api.virtual_alloc(base + kPage64k, 2 * kPage64k,
+                                           MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x27,
+                                           PAGE_READWRITE | PAGE_GRAPHICS_READONLY);
+    check(window == base + kPage64k, "a reserve-only MEM_REPLACE_PLACEHOLDER returns the address it replaced");
+
+    auto* const committed = static_cast<uint8_t*>(
+        api.virtual_alloc(base + 4 * kPage64k, kPage64k,
+                          MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | kXmem64kPages, 0x27, PAGE_READWRITE));
+    check(committed == base + 4 * kPage64k, "a committing MEM_REPLACE_PLACEHOLDER returns the address it replaced");
+    if (committed) {
+        committed[0] = 0x5a;
+        check(committed[0] == 0x5a, "the committed replacement is writable");
+    }
+
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    check(api.allocate(0x380, &count, pages) == TRUE && count == 2, "allocate two pages for the carved window");
+    check(api.map(window, 2, pages) == window, "pages map into a window carved out of a placeholder");
+    if (window) {
+        fill_page(static_cast<uint8_t*>(window) + kPage64k, 0xabc0000u);
+        check(page_holds(static_cast<uint8_t*>(window) + kPage64k, 0xabc0000u), "the carved window holds data");
+    }
+    check(api.map(window, 2, nullptr) == window, "unmap the carved window");
+    check(api.free_pages(2, pages) == TRUE, "free the carved window's pages");
+    check(reserved_only(base), "the rest of the placeholder is still reserved");
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
@@ -376,121 +603,6 @@ void test_transfer_trace(XMemTransferMemoryFn transfer) {
     DeleteFileW(path.c_str());
 }
 
-// The console's page-size bits in the allocation type: MEM_LARGE_PAGES alone is 2 MiB pages, MEM_4MB_PAGES (with or
-// without MEM_LARGE_PAGES) 4 MiB pages, and MEM_LARGE_PAGES | MEM_PHYSICAL 64 KiB pages. None of them needs a host
-// privilege: the region is ordinary pages, reserved at the page size's alignment and rounded to whole pages.
-constexpr DWORD kLargePages = 0x20000000;
-constexpr DWORD k4MbPages = 0x80000000;
-constexpr DWORD k64kPages = 0x20400000;
-constexpr SIZE_T k2MiB = 0x200000;
-constexpr SIZE_T k4MiB = 0x400000;
-
-struct PageMode {
-    DWORD bits;
-    SIZE_T page;
-    const char* name;
-};
-constexpr PageMode kLargeModes[] = {
-    {kLargePages, k2MiB, "2 MiB (0x20000000)"},
-    {k4MbPages, k4MiB, "4 MiB (0x80000000)"},
-    {k4MbPages | kLargePages, k4MiB, "4 MiB (0xa0000000)"},
-};
-
-bool is_aligned(const void* p, SIZE_T alignment) {
-    return p && (reinterpret_cast<uintptr_t>(p) & (alignment - 1)) == 0;
-}
-
-// One run of pages as VirtualQuery sees it from `base`: exactly `size` bytes in `state`, inside the allocation that
-// starts at `allocation` (by default `base` itself). Writes the first and last byte when it is committed.
-bool region_is(void* base, SIZE_T size, DWORD state, void* allocation = nullptr) {
-    MEMORY_BASIC_INFORMATION info{};
-    if (VirtualQuery(base, &info, sizeof(info)) != sizeof(info)) return false;
-    if (!allocation) allocation = base;
-    if (info.BaseAddress != base || info.AllocationBase != allocation || info.RegionSize != size ||
-        info.State != state) {
-        std::printf("  query %p: base %p allocation base %p size %#zx state %#lx\n", base, info.BaseAddress,
-                    info.AllocationBase, static_cast<size_t>(info.RegionSize), static_cast<unsigned long>(info.State));
-        return false;
-    }
-    if (state == MEM_COMMIT) {
-        auto* const bytes = static_cast<volatile uint8_t*>(base);
-        bytes[0] = 0x11;
-        bytes[size - 1] = 0x22;
-        return bytes[0] == 0x11 && bytes[size - 1] == 0x22;
-    }
-    return true;
-}
-
-bool released(void* base) {
-    if (!VirtualFree(base, 0, MEM_RELEASE)) return false;
-    MEMORY_BASIC_INFORMATION info{};
-    return VirtualQuery(base, &info, sizeof(info)) == sizeof(info) && info.State == MEM_FREE;
-}
-
-void test_virtual_alloc_large_pages(XMemVirtualAllocFn virtual_alloc) {
-    char what[200];
-    for (const PageMode& mode : kLargeModes) {
-        // Not a whole page, so the size has to round up: 1.5 pages -> 2 pages.
-        const SIZE_T request = mode.page + mode.page / 2;
-        const SIZE_T rounded = mode.page * 2;
-        SetLastError(ERROR_SUCCESS);
-        void* const p = virtual_alloc(nullptr, request, MEM_RESERVE | MEM_COMMIT | mode.bits, 0, PAGE_READWRITE);
-        std::snprintf(what, sizeof what, "XMemVirtualAlloc with %s pages returns memory (error %lu)", mode.name,
-                      p ? 0ul : static_cast<unsigned long>(GetLastError()));
-        check(p != nullptr, what);
-        if (!p) continue;
-        std::snprintf(what, sizeof what, "XMemVirtualAlloc with %s pages is aligned to the page size", mode.name);
-        check(is_aligned(p, mode.page), what);
-        std::snprintf(what, sizeof what, "XMemVirtualAlloc with %s pages commits whole pages", mode.name);
-        check(region_is(p, rounded, MEM_COMMIT), what);
-        std::snprintf(what, sizeof what, "VirtualFree releases a %s page region", mode.name);
-        check(released(p), what);
-
-        // No operation bits: XMemVirtualAlloc reserves and commits, as for the other page modes.
-        void* const defaulted = virtual_alloc(nullptr, 1, mode.bits, 0, PAGE_READWRITE);
-        std::snprintf(what, sizeof what, "XMemVirtualAlloc(1 byte, %s pages, no operation) commits one page",
-                      mode.name);
-        check(is_aligned(defaulted, mode.page) && region_is(defaulted, mode.page, MEM_COMMIT), what);
-        if (defaulted) VirtualFree(defaulted, 0, MEM_RELEASE);
-
-        // Reserve, then commit by an address inside the second page: the commit covers that whole page and starts at
-        // its base, the console's commit granularity.
-        void* const reserved =
-            virtual_alloc(nullptr, mode.page * 3, MEM_RESERVE | MEM_TOP_DOWN | mode.bits, 0, PAGE_READWRITE);
-        std::snprintf(what, sizeof what, "a %s page reservation with MEM_TOP_DOWN is aligned and stays reserved",
-                      mode.name);
-        check(is_aligned(reserved, mode.page) && region_is(reserved, mode.page * 3, MEM_RESERVE), what);
-        if (!reserved) continue;
-        auto* const second = static_cast<uint8_t*>(reserved) + mode.page;
-        void* const committed = virtual_alloc(second + 0x1234, 0x10, MEM_COMMIT | mode.bits, 0, PAGE_READWRITE);
-        std::snprintf(what, sizeof what, "committing inside a %s page commits that page from its base", mode.name);
-        check(committed == second && region_is(second, mode.page, MEM_COMMIT, reserved), what);
-        std::snprintf(what, sizeof what, "the pages around a %s page commit stay reserved", mode.name);
-        check(region_is(reserved, mode.page, MEM_RESERVE) &&
-                  region_is(second + mode.page, mode.page, MEM_RESERVE, reserved),
-              what);
-        std::snprintf(what, sizeof what, "VirtualFree releases the whole %s page reservation", mode.name);
-        check(released(reserved), what);
-    }
-
-    // Combinations no page size answers stay invalid, before anything is allocated.
-    for (const DWORD bits : {DWORD{k64kPages | k4MbPages}, DWORD{k4MbPages | 0x00400000}, DWORD{0x00400000}}) {
-        SetLastError(ERROR_SUCCESS);
-        void* const p = virtual_alloc(nullptr, k4MiB, MEM_RESERVE | MEM_COMMIT | bits, 0, PAGE_READWRITE);
-        std::snprintf(what, sizeof what, "XMemVirtualAlloc rejects page bits %#lx with ERROR_INVALID_PARAMETER",
-                      static_cast<unsigned long>(bits));
-        check(p == nullptr && GetLastError() == ERROR_INVALID_PARAMETER, what);
-        if (p) VirtualFree(p, 0, MEM_RELEASE);
-    }
-
-    // The retail executable's shape: attributes 0x183 and protect 0x22004 with 2 MiB pages, reserve and commit.
-    void* const attributed =
-        virtual_alloc(nullptr, k2MiB, MEM_RESERVE | MEM_COMMIT | kLargePages, 0x183, 0x22004);
-    check(attributed != nullptr && reinterpret_cast<uintptr_t>(attributed) % k2MiB == 0,
-          "a nonzero attribute word with 2 MiB pages is recorded, not refused, and the base is 2 MiB aligned");
-    if (attributed) check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed 2 MiB region");
-}
-
 using HostVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, DWORD);
 
 // RT-217: a title's kernel32!VirtualAlloc carries the console's MEM_GRAPHICS / MEM_TITLE type bits, which the host
@@ -524,43 +636,6 @@ void test_title_virtual_alloc() {
             check(static_cast<volatile uint8_t*>(p)[0] == 0x5a, "the allocation is committed and writable");
             check(VirtualFree(p, 0, MEM_RELEASE), "release the allocation");
         }
-    }
-}
-
-// The same page-size bits through a title's kernel32!VirtualAlloc. The host reads 0x20000000 as its own
-// MEM_LARGE_PAGES (which needs SeLockMemoryPrivilege) and rejects 0x80000000, so these failed before the shim
-// handled them. Win32 rules stay: an operation (reserve or commit) is required.
-void test_title_virtual_alloc_large_pages() {
-    constexpr DWORD kMemGraphics = 0x10000000;
-    constexpr DWORD kMemTitle = 0x40000000;
-    const char* const dlls[] = {"kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-l1-1-0.dll"};
-    char what[200];
-    for (const char* dll : dlls) {
-        const auto alloc = reinterpret_cast<HostVirtualAllocFn>(rt::shims::find(dll, "VirtualAlloc"));
-        if (!alloc) continue;  // test_title_virtual_alloc reports the missing registration
-        for (const PageMode& mode : kLargeModes) {
-            for (const DWORD tags : {DWORD{0}, DWORD{kMemGraphics | kMemTitle}}) {
-                SetLastError(ERROR_SUCCESS);
-                void* const p = alloc(nullptr, mode.page + 1, MEM_RESERVE | MEM_COMMIT | mode.bits | tags,
-                                      PAGE_READWRITE);
-                std::snprintf(what, sizeof what, "%s!VirtualAlloc, %s pages, tags %#lx: aligned, two pages (error %lu)",
-                              dll, mode.name, static_cast<unsigned long>(tags),
-                              p ? 0ul : static_cast<unsigned long>(GetLastError()));
-                check(is_aligned(p, mode.page) && region_is(p, mode.page * 2, MEM_COMMIT), what);
-                if (p) check(released(p), "release the title's large-page region");
-            }
-        }
-
-        void* const sixty_four = alloc(nullptr, 0x1001, MEM_RESERVE | MEM_COMMIT | k64kPages, PAGE_READWRITE);
-        std::snprintf(what, sizeof what, "%s!VirtualAlloc with 64 KiB pages commits one 64 KiB page", dll);
-        check(is_aligned(sixty_four, 0x10000) && region_is(sixty_four, 0x10000, MEM_COMMIT), what);
-        if (sixty_four) VirtualFree(sixty_four, 0, MEM_RELEASE);
-
-        SetLastError(ERROR_SUCCESS);
-        void* const no_operation = alloc(nullptr, k2MiB, kLargePages, PAGE_READWRITE);
-        std::snprintf(what, sizeof what, "%s!VirtualAlloc with 2 MiB pages and no operation fails as on Win32", dll);
-        check(no_operation == nullptr && GetLastError() == ERROR_INVALID_PARAMETER, what);
-        if (no_operation) VirtualFree(no_operation, 0, MEM_RELEASE);
     }
 }
 
@@ -601,6 +676,25 @@ int main() {
     check(reset_write_watch != nullptr, "registry exposes xmem.dll!XMemResetWriteWatch");
     check(transfer != nullptr, "registry exposes xmem.dll!XMemTransferMemory");
 
+    const auto alloc_default = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAllocDefault"));
+    const auto free_default = reinterpret_cast<XMemFreeFn>(rt::shims::find("xmem.dll", "XMemFreeDefault"));
+    const auto tools_mem =
+        reinterpret_cast<XMemIsToolsMemAvailableFn>(rt::shims::find("xmem.dll", "XMemIsToolsMemAvailable"));
+    const PhysicalApi physical{
+        virtual_alloc,
+        reinterpret_cast<XMemAllocatePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemAllocatePhysicalPages")),
+        reinterpret_cast<XMemFreePhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemFreePhysicalPages")),
+        reinterpret_cast<XMemMapPhysicalPagesFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPages")),
+        reinterpret_cast<XMemMapPhysicalPagesScatterFn>(rt::shims::find("xmem.dll", "XMemMapPhysicalPagesScatter")),
+    };
+    check(alloc_default != nullptr, "registry exposes xmem.dll!XMemAllocDefault");
+    check(free_default != nullptr, "registry exposes xmem.dll!XMemFreeDefault");
+    check(tools_mem != nullptr, "registry exposes xmem.dll!XMemIsToolsMemAvailable");
+    check(physical.allocate != nullptr, "registry exposes xmem.dll!XMemAllocatePhysicalPages");
+    check(physical.free_pages != nullptr, "registry exposes xmem.dll!XMemFreePhysicalPages");
+    check(physical.map != nullptr, "registry exposes xmem.dll!XMemMapPhysicalPages");
+    check(physical.scatter != nullptr, "registry exposes xmem.dll!XMemMapPhysicalPagesScatter");
+
     if (!alloc || !free_mem || !query || !get_stats) {
         print_result();
         return 1;
@@ -611,7 +705,6 @@ int main() {
     test_virtual_query(query);
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
-        test_virtual_alloc_large_pages(virtual_alloc);
     }
     test_attribute_trace(alloc, free_mem, virtual_alloc);
     if (transfer) {
@@ -620,7 +713,13 @@ int main() {
     }
 
     test_title_virtual_alloc();
-    test_title_virtual_alloc_large_pages();
+
+    if (alloc_default && free_default) test_default_alloc(alloc, free_mem, alloc_default, free_default);
+    if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
+    if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
+        test_physical_pages(physical);
+        test_placeholders(physical);
+    }
 
     print_result();
     return g_failures ? 1 : 0;
