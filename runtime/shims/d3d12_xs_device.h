@@ -81,7 +81,9 @@
 // reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
 // (PresentX, SuspendX, ResumeX) will show up; the sibling-layer measurement puts PresentX at queue slot 30 or 32
 // and SignalX at 23 or 25 by runtime layout (docs/d3d12_xs_console_abi.md §4, unverified here). The proxy detects
-// the layout from a fence reaching slot 16/17, forwards SignalX as PC Signal, routes PresentX to the presentation
+// the layout from a fence reaching slot 16/17, forwards SignalX as PC Signal, forwards queue slot 35 (the console
+// ExecuteCommandLists(count, lists) variant) to PC slot 10 unless the layout is proven older, routes PresentX
+// to the presentation
 // core under LEONIDA_VULKAN_DEVICE and answers the remaining console-only queue methods S_OK (frame pacing flows
 // through them) without forwarding, and that
 // the console keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
@@ -192,6 +194,9 @@ unsigned queue_proxy_slot_count(const void* queue);
 unsigned fence_proxy_slot_count(const void* fence);
 unsigned queue_proxy_table_size();
 unsigned fence_proxy_table_size();
+// True for queue slots handled by the proxy instead of forwarded verbatim past IUnknown: 0-2 (IUnknown),
+// 7 (GetDevice), 14/15 (Signal/Wait unwrap fences), and 35 (Xbox ExecuteCommandLists variant -> PC slot 10).
+bool queue_slot_overridden(unsigned slot);
 // Live references on a queue, fence or allocator proxy (0 for anything else). Test helper.
 unsigned long command_object_proxy_ref_count(const void* object);
 // Per-slot call counters and first-call flags, shared by all queue proxies and all fence proxies.

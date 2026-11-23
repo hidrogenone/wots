@@ -385,6 +385,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
             default: break;
         }
     }
+    if (m->kind == Kind::queue && slot == 10) copy_array(m, slot, a2, a1);  // ExecuteCommandLists(n, lists)
     if (m->kind == Kind::queue && slot == 16 && a1) {
         // GetTimestampFrequency writes a fixed value — unless a1 is a mock object, which on this slot is a
         // newer-layout Signal's fence, not an out pointer.
@@ -1849,6 +1850,81 @@ int check_xbox_slots() {
 #endif
 }
 
+// ---- 7b. Xbox queue ExecuteCommandLists variant (queue slot 35 -> PC slot 10) ----
+
+int check_xbox_queue_slots() {
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device);
+    void* queue = make_queue(device);
+    EXPECT(queue);
+    Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    xs::reset_device_proxy_stats();
+
+    EXPECT(xs::queue_slot_overridden(35) && xs::queue_slot_overridden(14) && xs::queue_slot_overridden(15));
+    EXPECT(!xs::queue_slot_overridden(10) && !xs::queue_slot_overridden(34) && !xs::queue_slot_overridden(36));
+
+    // Two console-shaped lists, as a title holds them (device slot 12), and a real list beside them.
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    void* lists[3] = {};
+    Mock* real[2] = {};
+    for (int i = 0; i < 2; ++i) {
+        EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0, word(&gcl_iid),
+                         word(&lists[i]))) == S_OK);
+        real[i] = mock->last_child;
+        EXPECT(xs::is_list_proxy(lists[i]) && word(xs::list_proxy_real_list(lists[i])) == word(real[i]));
+    }
+    lists[2] = real[0];
+
+    // An undetected layout, as at the retail title's first call: slot 35 (count, lists, frame token, flags) reaches
+    // the real queue's slot 10 with a clean UINT count and a copy of the array that holds the real lists, never the
+    // proxies. The token and the flags are dropped.
+    EXPECT(raw(queue, 35, (0xdeadbeefull << 32) | 3ull, word(lists), 0x1111, 3) == 0);
+    EXPECT(xs::queue_slot_hits(35) == 1 && xs::queue_slot_first_call_seen(35));
+    EXPECT(xs::queue_slot_hits(10) == 0);
+    EXPECT(queue_mock->calls[35] == 0 && queue_mock->calls[10] == 1);
+    EXPECT(queue_mock->args[10][0] == 3 && queue_mock->args[10][1] != word(lists));
+    EXPECT(queue_mock->array[10][0] == word(real[0]) && queue_mock->array[10][1] == word(real[1]) &&
+           queue_mock->array[10][2] == word(real[0]));
+
+    // PC slot 10 goes through the same unwrap.
+    std::memset(queue_mock->array[10], 0, sizeof(queue_mock->array[10]));
+    EXPECT(raw(queue, 10, 2, word(lists)) == 0 && xs::queue_slot_hits(10) == 1);
+    EXPECT(queue_mock->calls[10] == 2 && queue_mock->args[10][0] == 2);
+    EXPECT(queue_mock->array[10][0] == word(real[0]) && queue_mock->array[10][1] == word(real[1]));
+
+    EXPECT(raw(queue, 35, 0, 0) == 0);
+    EXPECT(xs::queue_slot_hits(35) == 2 && queue_mock->calls[35] == 0 && queue_mock->calls[10] == 3);
+    EXPECT(queue_mock->args[10][0] == 0 && queue_mock->args[10][1] == 0);
+
+    // Proven newer (a fence at slot 16 is that layout's Signal): slot 35 keeps executing.
+    void* fence = make_fence(device);
+    EXPECT(fence && hr_of(raw(queue, 16, word(fence), 1)) == S_OK && queue_mock->calls[14] == 1);
+    EXPECT(raw(queue, 35, 1, word(lists)) == 0 && queue_mock->calls[10] == 4 && queue_mock->args[10][0] == 1);
+    EXPECT(release(fence) == 0 && release(lists[0]) == 0 && release(lists[1]) == 0 && release(allocator) == 0);
+    EXPECT(release(queue) == 0 && release(device) == 0 && mock->refs == 0);
+
+    // Proven older (a non-fence at slot 16 is that layout's frequency getter): slot 35 is an unmodelled console
+    // method there, answered S_OK with nothing forwarded.
+    Mock* older_mock = nullptr;
+    void* older_device = make_device(older_mock, 9, true);
+    void* older_queue = make_queue(older_device);
+    EXPECT(older_device && older_queue);
+    Mock* const older_queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(older_queue));
+    EXPECT(hr_of(raw(older_queue, 16, 0, 0)) == S_OK && older_queue_mock->calls[16] == 1);
+    void* none[1] = {};
+    EXPECT(hr_of(raw(older_queue, 35, 1, word(none))) == S_OK);
+    EXPECT(older_queue_mock->calls[10] == 0 && older_queue_mock->calls[35] == 0);
+    EXPECT(release(older_queue) == 0 && release(older_device) == 0 && older_mock->refs == 0);
+    std::printf("%s: queue slot 35 routes ExecuteCommandLists(count, lists) to PC slot 10 with UINT count masking "
+                "and the list proxies replaced by their lists, as slot 10 itself; a proven-older queue does not "
+                "route it\n", g_label);
+    return 0;
+}
+
 // ---- 8. Environment overrides for the Xbox device slots (one process each, read once) ----
 
 int run_env_slots(bool valid, bool on_slot70 = false, bool on_slot74 = false) {
@@ -2302,9 +2378,12 @@ int check_tail(bool want_guarded) {
     EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
     // Console-only queue methods (the tail past the PC chain, SignalX, PresentX) report S_OK instead of
-    // refusing: frame pacing flows through them. Nothing is forwarded — the real queue never sees them.
-    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
+    // refusing: frame pacing flows through them. Nothing is forwarded — the real queue never sees them. Slot 35
+    // (ExecuteCommandListsX) is forwarded on a queue like this one, of unknown layout: check_xbox_queue_slots.
+    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
+        if (xs::queue_slot_overridden(slot)) continue;
         EXPECT(hr_of(raw(queue, slot)) == S_OK && queue_mock->calls[slot] == 0);
+    }
     EXPECT(raw(fence, 12) != 0);  // the completed value's address (check_fence_completed_value)
     for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
@@ -2796,6 +2875,7 @@ int main(int argc, char** argv) {
         check_create_failures() ||
         check_open_shared() || check_alloc_failures() || check_allocators() || check_render_target_sizes() ||
         check_allocation_descriptions_cleaned() || check_render_target_layout() || check_xbox_slots() ||
+        check_xbox_queue_slots() ||
         check_custom_heap_properties() || check_lists() || check_signalx_detection() || check_list_tail_names() ||
         check_descriptor_heap_hooks() || check_slot70() || check_slot70_raw_buffer() || check_committed_resource3_x() ||
         check_committed_resource_leases() || check_slot74())

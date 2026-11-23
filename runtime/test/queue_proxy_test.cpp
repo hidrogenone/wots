@@ -258,7 +258,10 @@ int check_slots(const Backend& b) {
             }
         }
 
-        // 10: ExecuteCommandLists passes the (real, not wrapped) command lists through.
+        // 10 and console slot 35: ExecuteCommandLists passes the (real, not wrapped) command lists through.
+        // The queue's layout is still unknown here, as at the retail title's first slot-35 call.
+        EXPECT(xs::queue_slot_overridden(35) && xs::queue_slot_overridden(14) && xs::queue_slot_overridden(15));
+        EXPECT(!xs::queue_slot_overridden(10) && !xs::queue_slot_overridden(34));
         {
             Ref<ID3D12CommandAllocator> allocator;
             EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -273,6 +276,11 @@ int check_slots(const Backend& b) {
             EXPECT(qhits(10) == before + 1);
             EXPECT(SUCCEEDED(queue->Signal(fence.p, 6)));
             if (wait_for(label, fence.p, 6)) return 1;
+            const std::uint64_t before35 = qhits(35);
+            EXPECT(raw_call(queue.p, 35, 1, reinterpret_cast<std::uint64_t>(lists)) == 0);
+            EXPECT(qhits(35) == before35 + 1 && xs::queue_slot_first_call_seen(35));
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 7)));
+            if (wait_for(label, fence.p, 7)) return 1;
             if (b.vulkan) {
                 // The layer's own helpers find their queue behind the proxy.
                 EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
@@ -294,17 +302,17 @@ int check_slots(const Backend& b) {
 
         // 14/15: Signal and Wait take fence proxies; the real queue gets the real fences.
         before = qhits(14);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 7)));
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 8)));
         EXPECT(qhits(14) == before + 1);
-        if (wait_for(label, fence.p, 7)) return 1;
+        if (wait_for(label, fence.p, 8)) return 1;
         before = qhits(15);
-        EXPECT(SUCCEEDED(queue->Wait(fence.p, 8)));  // the queue waits until the CPU signals 8
+        EXPECT(SUCCEEDED(queue->Wait(fence.p, 9)));  // the queue waits until the CPU signals 9
         EXPECT(qhits(15) == before + 1);
         EXPECT(SUCCEEDED(queue->Signal(second.p, 1)));
         Sleep(50);
         EXPECT(second->GetCompletedValue() == 0);  // still held by the Wait
         before = fhits(10);
-        EXPECT(SUCCEEDED(fence->Signal(8)));  // fence 10, from the CPU
+        EXPECT(SUCCEEDED(fence->Signal(9)));  // fence 10, from the CPU
         EXPECT(fhits(10) == before + 1);
         if (wait_for(label, second.p, 1)) return 1;
 
@@ -360,12 +368,12 @@ int check_slots(const Backend& b) {
             EXPECT(fhits(7) == before + 1);
         }
         before = fhits(8);
-        EXPECT(fence->GetCompletedValue() == 8);
+        EXPECT(fence->GetCompletedValue() == 9);
         EXPECT(fhits(8) == before + 1);
         {
             Event done;
             before = fhits(9);
-            EXPECT(SUCCEEDED(fence->SetEventOnCompletion(8, done.h)) && done.set_within(5000));
+            EXPECT(SUCCEEDED(fence->SetEventOnCompletion(9, done.h)) && done.set_within(5000));
             EXPECT(fhits(9) == before + 1);
         }
         if (fence_slots == 12) {
@@ -394,35 +402,36 @@ int check_slots(const Backend& b) {
         // signal without another call (a wait on the real fence refreshes it).
         {
             before = fhits(12);
-            const auto* completed = reinterpret_cast<const volatile UINT64*>(raw_call(fence.p, 12, 9, 0, 0));
+            const auto* completed = reinterpret_cast<const volatile UINT64*>(raw_call(fence.p, 12, 10, 0, 0));
             EXPECT(completed && *completed == fence->GetCompletedValue() && fhits(12) == before + 1);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 9)));
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 10)));
             bool seen = false;
             for (int i = 0; i < 5000 && !seen; ++i) {
-                seen = *completed == 9;
+                seen = *completed == 10;
                 if (!seen) Sleep(1);
             }
             EXPECT(seen);
-            EXPECT(raw_call(fence.p, 12, 9, 0, 0) == reinterpret_cast<std::uint64_t>(completed));
+            EXPECT(raw_call(fence.p, 12, 10, 0, 0) == reinterpret_cast<std::uint64_t>(completed));
         }
 
         // The console queue tail answers S_OK instead of refusing: frame pacing flows through those
         // methods, the contract xs_proxy_mock checks too. The two methods the proxy models — SignalX at
         // 23 and PresentX at 30 on the older layout the 16/17 calls above pinned — are checked below.
         // The fence tail below is still refused, but for slot 12 (above) — nothing else console-shaped was
-        // measured past its public chain.
+        // measured past its public chain. Slot 35 executed lists above, while this queue's layout was
+        // unknown; the 16/17 calls have proven it older since, so here it is one of the S_OK answers.
         for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
             if (slot == 23 || slot == 30) continue;
             before = qhits(slot);
             EXPECT(as_hr(call_slot(queue.p, slot)) == S_OK);
             EXPECT(qhits(slot) == before + 1 && xs::queue_slot_first_call_seen(slot));
         }
-        // SignalX forwards to the real queue's Signal with the extra word dropped: the fence reaching 10
+        // SignalX forwards to the real queue's Signal with the extra word dropped: the fence reaching 11
         // proves the call was forwarded rather than swallowed by the console-tail answer.
         before = qhits(23);
-        EXPECT(as_hr(raw_call(queue.p, 23, reinterpret_cast<std::uint64_t>(fence.p), 10)) == S_OK);
+        EXPECT(as_hr(raw_call(queue.p, 23, reinterpret_cast<std::uint64_t>(fence.p), 11)) == S_OK);
         EXPECT(qhits(23) == before + 1 && xs::queue_slot_first_call_seen(23));
-        if (wait_for(label, fence.p, 10)) return 1;
+        if (wait_for(label, fence.p, 11)) return 1;
         // PresentX is handled by the presentation front end, not refused: its status is the swapchain's
         // (a black frame on the test window, or S_OK where it cannot present), so anything but E_NOTIMPL
         // shows the modelled path ran.
@@ -436,8 +445,8 @@ int check_slots(const Backend& b) {
             EXPECT(fhits(slot) == before + 1 && xs::fence_slot_first_call_seen(slot));
         }
         // The objects still work after the console-only calls.
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 11)));
-        if (wait_for(label, fence.p, 11)) return 1;
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 12)));
+        if (wait_for(label, fence.p, 12)) return 1;
         EXPECT(xs::command_object_proxy_ref_count(queue.p) == 1 && xs::command_object_proxy_ref_count(fence.p) == 1);
     }
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);  // every queue and fence gave its reference back
@@ -1512,6 +1521,56 @@ int check_xbox_client(const Backend& b) {
                                word(done.h)))) &&
            done.set_within(5000));
     EXPECT(raw(second.p, 8) == 1);
+
+    // A second copy with fresh bytes through console queue slot 35 (#7286), called as the retail title calls it:
+    // (count, lists, frame token, flags). check_slots has proven this device's layout older, where slot 35 is not
+    // routed, so the copy runs on a queue of the newer layout: a fence at its slot 16 is that layout's Signal. It
+    // comes last, because that detection is device-wide.
+    {
+        Ref<ID3D12CommandQueue> newer;
+        EXPECT(SUCCEEDED(as_hr(raw(device, 8, word(&queue_desc), word(&iid_queue), word(&newer.p)))));
+        EXPECT(xs::is_queue_proxy(newer.p));
+        EXPECT(SUCCEEDED(as_hr(raw(newer.p, 16, word(fence.p), 4))));
+        EXPECT(SUCCEEDED(as_hr(raw(fence.p, 9, 4, word(done.h)))) && done.set_within(5000));
+        {
+            std::uint8_t* bytes = nullptr;
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, reinterpret_cast<void**>(&bytes))));
+            for (UINT64 i = 0; i < kBytes; ++i) bytes[i] = static_cast<std::uint8_t>(i * 11 + 5);
+            upload->Unmap(0, nullptr);
+        }
+        EXPECT(SUCCEEDED(allocator->Reset()));
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        D3D12_RESOURCE_BARRIER to_dest{};
+        to_dest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_dest.Transition.pResource = gpu.p;
+        to_dest.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        to_dest.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        to_dest.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        list->ResourceBarrier(1, &to_dest);
+        list->CopyBufferRegion(gpu.p, 0, upload.p, 0, kBytes);
+        D3D12_RESOURCE_BARRIER to_source = to_dest;
+        to_source.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        to_source.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        list->ResourceBarrier(1, &to_source);
+        list->CopyBufferRegion(readback.p, 0, gpu.p, 0, kBytes);
+        EXPECT(SUCCEEDED(list->Close()));
+        EXPECT(raw(newer.p, 35, 1, word(lists), 0, 3) == 0);
+        EXPECT(SUCCEEDED(as_hr(raw(newer.p, 16, word(fence.p), 5))));
+        EXPECT(SUCCEEDED(as_hr(raw(fence.p, 9, 5, word(done.h)))) && done.set_within(5000));
+        EXPECT(raw(fence.p, 8) >= 5);
+        {
+            std::uint8_t* bytes = nullptr;
+            const D3D12_RANGE read_range{0, kBytes};
+            EXPECT(SUCCEEDED(readback->Map(0, &read_range, reinterpret_cast<void**>(&bytes))));
+            bool same = true;
+            for (UINT64 i = 0; i < kBytes; ++i) same = same && bytes[i] == static_cast<std::uint8_t>(i * 11 + 5);
+            const D3D12_RANGE nothing{0, 0};
+            readback->Unmap(0, &nothing);
+            EXPECT(same);  // the GPU really ran the list submitted via queue slot 35
+        }
+        EXPECT(raw(newer.p, 2) == 0);
+        newer.p = nullptr;
+    }
 
     // Release the way such a client does: through slot 2, the queue and fences before the resources.
     EXPECT(raw(second.p, 2) == 0);
