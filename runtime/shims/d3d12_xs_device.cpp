@@ -35,6 +35,7 @@
 // PresentX wiring: the queue's console slots land on the Xbox presentation core, which needs the Vulkan layer's
 // WindowPresenter. Other builds of this file (mock and COM tests) keep the refused-slot behaviour.
 #include "xbox_present.h"
+#include "title_window.h"
 #endif
 
 #include <windows.h>
@@ -1298,9 +1299,10 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 
 struct PresentState {
     ~PresentState() {
-        if (window) DestroyWindow(window);  // the presentation and its window die with the device proxy
+        if (window && owns_window) DestroyWindow(window);  // only the runtime's fallback, never the title's window
     }
     HWND window = nullptr;
+    bool owns_window = false;  // the fallback window made here, not the title's own (#8591)
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
     bool tried = false;  // creation is attempted once; a null xbox means this device cannot present
 };
@@ -1321,20 +1323,29 @@ PresentState* present_state_for(DeviceProxy* device) {
     if (!state) return nullptr;
     device->present_state = state;
     state->tried = true;
-    WNDCLASSW window_class{};
-    window_class.lpfnWndProc = present_window_proc;
-    window_class.hInstance = GetModuleHandleW(nullptr);
-    window_class.lpszClassName = L"LeonidaPresentX";
-    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
-        return state;
-    }
-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
-                                  window_class.hInstance, nullptr);
-    if (!state->window) {
-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
-        return state;
+    // The title's own top-level window (#8591): a GDKX title makes it before its first PresentX. Only when the process
+    // has none does the runtime make a fallback window of its own, shown so its frames are visible.
+    state->window = rt::d3d12::find_title_window(GetCurrentProcessId());
+    if (state->window) {
+        std::fprintf(stderr, "[rt] d3d12_xs: PresentX uses the title's window %p\n", static_cast<void*>(state->window));
+    } else {
+        WNDCLASSW window_class{};
+        window_class.lpfnWndProc = present_window_proc;
+        window_class.hInstance = GetModuleHandleW(nullptr);
+        window_class.lpszClassName = L"LeonidaPresentX";
+        if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+                                        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+                                        window_class.hInstance, nullptr);
+        if (!state->window) {
+            std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+            return state;
+        }
+        state->owns_window = true;
+        ShowWindow(state->window, SW_SHOWNOACTIVATE);
     }
     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
     if (!presenter) {
