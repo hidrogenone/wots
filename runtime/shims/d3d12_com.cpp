@@ -864,7 +864,8 @@ public:
         cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
-            if (!compute_pipeline_ || !compute_.layout) return check(false);
+            if (!compute_pipeline_) return;
+            if (!compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
         }
@@ -1395,7 +1396,9 @@ private:
     }
 
     void record_dispatch(UINT x, UINT y, UINT z) {
-        if (!compute_pipeline_ || !compute_.layout) return check(false);
+        // D3D12 permits a Dispatch without a compute PSO: it executes no shader and must not invalidate Close().
+        if (!compute_pipeline_) return;
+        if (!compute_.layout) return check(false);
         note_direct_heap_indexing(compute_.layout);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
@@ -1413,9 +1416,10 @@ private:
         return draw_views_;
     }
 
-    // A draw needs a graphics pipeline, a graphics root signature and a topology.
+    // A draw without a graphics PSO is a valid no-op; with a PSO it requires a graphics root signature and topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
-        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        if (!graphics_pipeline_) return;
+        if (!graphics_.layout || !topology_) return check(false);
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
