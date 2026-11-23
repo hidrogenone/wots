@@ -1550,7 +1550,13 @@ int check_descriptor_heap_hooks() {
 
     raw(device, 17, 0x11, kCustomBase + off3);                                          // CreateConstantBufferView
     EXPECT(real->args[17][1] == kMockHeapCpuStart + off3);
-    raw(device, 18, 0x22, 0x33, kCustomBase + off3);                                    // CreateShaderResourceView
+    // The descriptor is readable: the slot-70 mock also snapshots SRV arguments while the call is active.
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    raw(device, 18, 0, word(&srv), kCustomBase + off3);                                // CreateShaderResourceView
     EXPECT(real->args[18][2] == kMockHeapCpuStart + off3);
     raw(device, 19, 0x22, 0x33, 0x44, kCustomBase + off7);                              // CreateUnorderedAccessView
     EXPECT(real->args[19][3] == kMockHeapCpuStart + off7);
