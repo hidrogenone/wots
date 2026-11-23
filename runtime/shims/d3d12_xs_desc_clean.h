@@ -45,7 +45,12 @@ inline bool is_depth_resource_format(DXGI_FORMAT format) {
         case DXGI_FORMAT_R32G8X24_TYPELESS:
             return true;
         default:
-            return false;
+            // LOCAL STAND-IN (boot-chain test, not for upstream): the console's depth-16 stencil-8 resource formats,
+            // which the PC enum does not have: 117 (R16G8_TYPELESS) and 118 (D16_UNORM_S8_UINT), D24_UNORM_S8_UINT
+            // images in the PC layer since pull request 9305. Measured locally at a title's call site: slot 25 is
+            // asked for a 2D format-118 texture with ALLOW_DEPTH_STENCIL | ALLOW_UNORDERED_ACCESS. 119 and 120 are that
+            // family's view formats, like R24_UNORM_X8_TYPELESS and X24_TYPELESS_G8_UINT, which are not listed either.
+            return static_cast<std::uint32_t>(format) == 117 || static_cast<std::uint32_t>(format) == 118;
     }
 }
 

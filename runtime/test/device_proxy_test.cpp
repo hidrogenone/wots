@@ -286,6 +286,12 @@ int main(int argc, char** argv) {
         {DXGI_FORMAT_R32_FLOAT, kUav, kUav, "R32_FLOAT keeps UAV"},
         {DXGI_FORMAT_R32_TYPELESS, kUav, kUav, "R32_TYPELESS without DS keeps UAV"},
         {DXGI_FORMAT_D16_UNORM, kDepthStencil | kUav, kDepthStencil, "D16 depth keeps only DS"},
+        // LOCAL STAND-IN (boot-chain test, not for upstream): the console's depth-16 stencil-8 resource formats 117
+        // and 118 lose the bit like the PC depth formats; 119, a view format of that family, is left as it came.
+        {static_cast<DXGI_FORMAT>(118), kDepthStencil | kUav, kDepthStencil, "console D16_UNORM_S8_UINT keeps only DS"},
+        {static_cast<DXGI_FORMAT>(117), kDepthStencil | kUav, kDepthStencil, "console R16G8_TYPELESS keeps only DS"},
+        {static_cast<DXGI_FORMAT>(118), kUav, kUav, "console D16_UNORM_S8_UINT without DS keeps UAV"},
+        {static_cast<DXGI_FORMAT>(119), kDepthStencil | kUav, kDepthStencil | kUav, "a console view format keeps both"},
     };
     for (const auto& test : flag_cases) {
         D3D12_RESOURCE_DESC desc{};
