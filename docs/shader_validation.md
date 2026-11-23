@@ -1116,6 +1116,25 @@ First results on an RTX 4090 (subgroup 32, driver 621.14):
   - `--wave64-emulate auto` stays native on that driver, because it can crash on emulated LDS code (#857).
 - **Closed question (#374):** what hardware does for permlane with FI = 0 was measured on RDNA2 and RDNA3.5 (see above).
 
+### Wave and cross-lane ops on the CPU (`tools/wave_diff.py`)
+
+The same family as `crosslane_fuzz.py`, without a GPU or llvm-mc, so it can run wherever the translator tests run.
+The reference is `cf_ref.WaveMachine` (FUZZ-8) extended in `wave_diff.WaveRef` with the instructions it leaves out:
+`v_readlane`, `v_readfirstlane`, `v_writelane`, `ds_bpermute_b32` (per 32-lane half, an inactive source reads 0),
+`v_permlane16/x16` (FI = 0 with an inactive source leaves vD, as measured above), `s_bcnt0/1` and `s_ff0/1`
+(`_b32`/`_b64`, constants sign-extended to the operand width) and `s_not`. Each rule is written next to its instruction.
+The translated side is `spirv_mini_interp.run_workgroup`, every lane of the wave in one subgroup of the wave's size, and
+all 12 dwords every lane stores are compared (four VGPRs, two masks, VCC and the final EXEC as each lane's bit, four
+scalars). Programs are straight-line wave32 and wave64 compute under random EXEC (`v_cmpx`, saveexec, constants).
+
+By default the generator keeps lane masks and 64-bit data in separate registers and only issues `v_permlane` with every
+lane on, so a default run is a regression check. Two known gaps on `main` are opt-in: `--masks-as-data` (#210, #293) and
+`--permlane-partial` (SHADER-74, #580).
+
+Results (`--max-ops 16`, half wave32, half wave64, nothing skipped): it found `s_and_b32 exec_lo, exec_lo, K` in
+wave32 and `s_ff0_i32_b64` of a negative constant (#1409), both fixed on `main` since; on `main` 7b7d73f8, 600 of
+600 match (seeds 401 to 403).
+
 ### 32-bit float VALU on the GPU (`tools/f32_fuzz.py`, FUZZ-3)
 
 `--oracle hw` (or `translator,hw`) runs the same seeded VOP1/VOP2/VOP3 f32 programs natively on the AMD GPU and judges
@@ -2127,6 +2146,12 @@ tolerance (1e-3 absolute plus relative), NaN or all-zero on one GPU only, fails 
 Variant `t` (`VKS_TEX=1`) replaces the fallback images with an 8x8 gradient (2D, 2D array, 1D, 3D) and a linear
 sampler so sampled values are not all zero.
 
+Warning: a few sampled shaders hang NVIDIA GPUs with the zeroed heap (see "Fails on one GPU, NVIDIA" below). The
+`--timeout` of `ps_sweep.py run` only bounds the wait on the host side; the driver resets the GPU (TDR). On a GPU that
+also drives the display the desktop freezes until each reset (a tester saw five in six minutes on an RTX 3060 around
+shaders 120 to 310 of the 480). Run it on a GPU with no display attached, or expect a freeze of a few seconds per hang;
+`--lo`/`--hi`/`--only` run part of the sample.
+
 RTX 4080 SUPER and Intel UHD 770 (32.0.101.6129), Windows 11, 480 of 12,101 pixel shaders (seed 20261122):
 
 | class | variant z (fallback images) | variant t (gradient textures) |
@@ -2157,6 +2182,30 @@ RTX 4080 SUPER and Intel UHD 770 (32.0.101.6129), Windows 11, 480 of 12,101 pixe
   zeroed heap mostly samples zero or discards). That is the limit of the synthetic inputs: a
   seeded heap was tried and abandoned, because a pointer read from float data is a wild address and takes NVIDIA's
   device down.
+
+**With the fallbacks (`--bary-fallback` plus the MinLod fallback of #4642, same 480 shaders, variant z).** The same sample was
+retranslated with both flags and drawn through `<name>.bary_gs.spv` where a shader reads raw barycentrics (`VKS_GS`,
+`tools/bary_fallback_gs.py`). The Intel UHD 770 creates 440 of the 480 (265 before; the 207 that needed
+`fragmentShaderBarycentric` or `shaderResourceMinLod` are gone), 32 time out (zeroed-heap loops, which the same
+translation also hits on the RTX 4080 SUPER), and 8 are not translated (`computed I/J pair under --bary-fallback`,
+#3898). Intel against NVIDIA on the same fallback translation: 434 OK on both, 0 differ, 4 NVIDIA device losses
+(the unterminated loop above), 8 not translated, 34 timeouts on both. Intel with the fallbacks against NVIDIA with
+the default translation: 373 OK, 53 differ by more than 0.1 and 8 are NaN on one side. The same 61 differ between the
+two translations on NVIDIA alone, so it is the translation, not the GPU. **Cause (counted on the same 480 translated
+again, `--bary-fallback` alone, without the MinLod flag of #4642, against the default):** 199 modules differ between the two translations, 190 that read a
+16-bit interpolant (`v_interp_p1ll/p1lv/p2_f16`) and the 9 that read raw barycentrics; the other 273 translated under
+both are byte-identical, so ordinary `v_interp_p1/p2/mov_f32` is not translated differently (the remaining 8 are not
+translated under the fallback). `--bary-fallback` has no `PerVertexKHR` inputs, so a 16-bit interpolant is read as the
+smooth f32 of its packed word (design.md, "16-bit interpolation"); `--f16-interp-fallback` is its companion, and
+`make_game.py` turns it on with it wherever the device has no per-vertex inputs, as an Intel UHD has none. The sweep
+used the first flag without the second, and its generated vertex shader wrote the decoded halves nowhere. The synthetic
+`ps_interp_f16_high` drawn with `vs_f16_pack` agrees: with `--bary-fallback` alone its f16 halves are off by 0.984 on
+both GPUs, with both flags and by default they are within 2e-3 on both, and `ps_interp_f32_mods` / `ps_interp_mov_mods`
+(plain f32 and mov reads) are exact with `--bary-fallback`. `ps_sweep.py` now builds the vertex shader of a pixel
+shader with `f16_halves` in its index entry so that the halves are decoded from the same words a default translation
+reads per vertex. Not shown: the 61 individually (a 12-shader subset of the 190 agreed between the two translations on
+the RTX 4080 SUPER; draws of these shaders take about 20 s each). Only 9 of the 480 read raw
+barycentrics and need the geometry shader; all 9 agree on both GPUs.
 
 ## Coverage plan and cost
 

@@ -1309,8 +1309,9 @@ if(TARGET Vulkan::Headers)
     endif()
   endif()
   if(BUILD_TESTING)
-    if(WIN32)
+    if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       # Real Win32 environment and DXGI names, with D3D12 device creation stubbed: no GPU commands or game files.
+      # It includes the runtime's D3D12 shim headers, so it needs the same Windows SDK as the runtime.
       add_executable(host_adapter_test test/host_adapter_test.cpp)
       target_link_libraries(host_adapter_test PRIVATE Vulkan::Headers dxgi)
       target_compile_definitions(host_adapter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -1684,6 +1685,17 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_texture_tiles PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
+    # DXR acceleration-structure prebuild and command-list recording validation parity test.
+    add_executable(d3d12_dxr_validation_test test/d3d12_dxr_validation_test.cpp)
+    target_link_libraries(d3d12_dxr_validation_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_dxr_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_dxr_validation_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_dxr_validation COMMAND d3d12_dxr_validation_test)
+    add_test(NAME d3d12_dxr_validation_khr COMMAND d3d12_dxr_validation_test)
+    set_tests_properties(d3d12_dxr_validation d3d12_dxr_validation_khr PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+    set_tests_properties(d3d12_dxr_validation_khr PROPERTIES ENVIRONMENT "LEONIDA_RT_AS=khr")
+
     # D3D12 permits UpdateTileMappings on DIRECT/COPY/COMPUTE and a sparse buffer must remain
     # accessible across their selected Vulkan families. The optional API-dump check catches an
     # EXCLUSIVE VkBuffer even on drivers that happen to return correct bytes without ownership barriers.
@@ -1922,6 +1934,16 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_close_parity_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_close_parity COMMAND d3d12_close_parity_test)
     set_tests_properties(d3d12_close_parity PROPERTIES SKIP_RETURN_CODE 77)
+
+    # ExecuteIndirect recording-time Close() parity against live WARP and hardware D3D12, plus GPU dispatch sanity.
+    add_executable(d3d12_execute_indirect_validation_test test/d3d12_execute_indirect_validation_test.cpp)
+    target_link_libraries(d3d12_execute_indirect_validation_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_execute_indirect_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_execute_indirect_validation_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_execute_indirect_validation COMMAND d3d12_execute_indirect_validation_test)
+    set_tests_properties(d3d12_execute_indirect_validation PROPERTIES
+      SKIP_RETURN_CODE 77
+      FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
     add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
@@ -3034,4 +3056,33 @@ if(TARGET Vulkan::Headers)
 else()
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_missing.cmake")
   leonida_vulkan_headers_missing()
+endif()
+
+# Timed condition-variable waits on Wine 9 (#3796): every Windows executable and DLL built against the dynamic CRT
+# (/MD, the default) gets src/crt_timed_wait.cpp, which keeps msvcprt.lib's statically linked timed wait out of the
+# link so that a wait and the mutex it unlocks always use msvcp140's own layout. A target that links the CRT
+# statically (MSVC_RUNTIME_LIBRARY MultiThreaded, MultiThreadedDebug) already agrees with itself and is left alone,
+# as are the fixtures linked with /NODEFAULTLIB, which have no CRT.
+if(WIN32 AND MSVC)
+  add_library(gta6rt_crt_timed_wait OBJECT src/crt_timed_wait.cpp)
+  target_compile_definitions(gta6rt_crt_timed_wait PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(gta6rt_crt_timed_wait PRIVATE /W4 /permissive- /utf-8)
+  # A timed wait is woken by a thread that takes its mutex; shared_mutex and sleep_for still work.
+  add_executable(crt_timed_wait_test test/crt_timed_wait_test.cpp)
+  target_compile_options(crt_timed_wait_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+  add_test(NAME crt_timed_wait COMMAND crt_timed_wait_test)
+  set_tests_properties(crt_timed_wait PROPERTIES TIMEOUT 60)
+  get_property(_gta6rt_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_target IN LISTS _gta6rt_targets)
+    get_target_property(_type ${_target} TYPE)
+    if(NOT _type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
+      continue()
+    endif()
+    get_target_property(_crt ${_target} MSVC_RUNTIME_LIBRARY)
+    get_target_property(_link_options ${_target} LINK_OPTIONS)
+    if((_crt AND NOT _crt MATCHES "DLL") OR "/NODEFAULTLIB" IN_LIST _link_options)
+      continue()  # static CRT, or no CRT at all (the CRT-free fixtures)
+    endif()
+    target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)
+  endforeach()
 endif()
