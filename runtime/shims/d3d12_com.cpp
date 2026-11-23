@@ -1043,7 +1043,10 @@ private:
                                 ? 1u
                                 : (desc.DepthOrArraySize ? desc.DepthOrArraySize : 1u);
         UINT planes = 1;
-        switch (desc.Format) {
+        // Xbox GDK D16_UNORM_S8_UINT family (117..120).
+        if (static_cast<UINT>(desc.Format) >= 117u && static_cast<UINT>(desc.Format) <= 120u) {
+            planes = 2;
+        } else switch (desc.Format) {
         case DXGI_FORMAT_D24_UNORM_S8_UINT:
         case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
         case DXGI_FORMAT_R24G8_TYPELESS:
