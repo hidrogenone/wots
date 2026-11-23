@@ -24,6 +24,8 @@
 //             buffer the device's resource provider knows, the destination gets a raw view of it (PC
 //             CreateShaderResourceView with that resource). Any other shape, or an unknown VA, gets the PC null view
 //             (CreateShaderResourceView with no resource) and the call returns.
+//   slot 74   (pointer, u32, pointer): not measured, returns S_OK. The PC slot 74 is ShaderCacheControl(kinds, control),
+//             which reads the first word as flags and returns E_INVALIDARG. Nothing is written, the PC device is not called.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
 //   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> PC CreateCommittedResource on a DEFAULT heap,
 //             with the Xbox flag bits dropped and an all-ones state as COMMON. Not backed by the memory at va.
@@ -161,7 +163,7 @@ IUnknown* real_object_behind_proxy(const void* object);
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 25/26 (the
 // console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and 78/79/80
-// (the Xbox slots above, at their configured indices), 56, 62, 67, 70, 76, 127 and 133. Slot 10 is intentionally false: the
+// (the Xbox slots above, at their configured indices), 56, 61, 62, 67, 70, 74, 76, 127 and 133. Slot 10 is intentionally false: the
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
