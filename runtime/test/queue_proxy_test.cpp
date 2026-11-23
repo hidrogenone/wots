@@ -1526,6 +1526,8 @@ int check_xbox_client(const Backend& b) {
     // (count, lists, frame token, flags). check_slots has proven this device's layout older, where slot 35 is not
     // routed, so the copy runs on a queue of the newer layout: a fence at its slot 16 is that layout's Signal. It
     // comes last, because that detection is device-wide.
+    // LOCAL STAND-IN (boot-chain test, not for upstream): pull request 7286 has this copy in the middle of the
+    // function, on its one queue; the newer-layout queue and the place are this branch's.
     {
         Ref<ID3D12CommandQueue> newer;
         EXPECT(SUCCEEDED(as_hr(raw(device, 8, word(&queue_desc), word(&iid_queue), word(&newer.p)))));

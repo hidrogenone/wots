@@ -1369,6 +1369,8 @@ std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::ui
 // further words, the frame token and the flags, are dropped). The array is copied with each list proxy replaced by
 // its real list, so the real queue only ever sees real lists; a bundle on the list side unwraps the same way at the
 // console's ExecuteBundle.
+// LOCAL STAND-IN (boot-chain test, not for upstream): the copy is not in pull request 7286, whose helper passes the
+// title's array on as it is; it is the unwrap of the list proxies that this branch did inline at slot 10.
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word) {
     UnwrappedArray unwrapped;
     if (!unwrapped.fill(lists_word, count_word)) return hr_to_u64(E_OUTOFMEMORY);
@@ -1500,6 +1502,8 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             // is served while the layout is still unknown as well, the way slot 18 is. A proven-older queue keeps
             // it as an unmodelled console method: that layout's slots from Signal on sit two lower, so its slot 35
             // is another method.
+            // LOCAL STAND-IN (boot-chain test, not for upstream): the layout condition is not in pull request 7286,
+            // which routes slot 35 whatever the layout.
             if (Slot == kQueueExecuteCommandListsX &&
                 (newer || (self->queue_layout.load(std::memory_order_relaxed) == ChildProxy::kQueueLayoutUnknown &&
                            self->device->console_layout.load(std::memory_order_relaxed) !=

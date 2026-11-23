@@ -1851,6 +1851,9 @@ int check_xbox_slots() {
 }
 
 // ---- 7b. Xbox queue ExecuteCommandLists variant (queue slot 35 -> PC slot 10) ----
+//
+// LOCAL STAND-IN (boot-chain test, not for upstream): pull request 7286's check, rewritten for this branch's list
+// proxies (the real queue gets the lists behind them) and its two queue layouts (no route on a proven-older queue).
 
 int check_xbox_queue_slots() {
     const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
