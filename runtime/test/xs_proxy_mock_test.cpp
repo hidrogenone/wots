@@ -1529,6 +1529,16 @@ int check_xbox_slots() {
     pso_stream_out = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw(device, 86, word(&stream_desc), 0, word(&pso_stream_out))) == E_POINTER && !pso_stream_out);
 
+    // LOCAL STAND-IN (boot-chain test, not for upstream): 55, the console CreateDerivedPipelineState(base PSO, n,
+    // records, riid, ppv), is refused with E_NOTIMPL and a null ppv. The PC slot 55 (CreateReservedResource1, six
+    // words) is not reached and nothing is written through a sixth word; a null ppv is accepted.
+    void* derived = reinterpret_cast<void*>(1);
+    void* sixth = reinterpret_cast<void*>(2);
+    EXPECT(hr_of(raw(device, 55, 0x5501, 2, 0x5503, word(&pso_iid), word(&derived), word(&sixth))) == E_NOTIMPL);
+    EXPECT(!derived && sixth == reinterpret_cast<void*>(2));
+    EXPECT(hr_of(raw(device, 55, 0x5501, 2, 0x5503, word(&pso_iid), 0)) == E_NOTIMPL);
+    EXPECT(mock->calls[55] == 0 && xs::device_slot_hits(55) == 2 && xs::device_slot_overridden(55));
+
     // 101 CreateStateObject(desc, riid, out) -> PC slot 62 (ID3D12Device5::CreateStateObject).
     D3D12_STATE_OBJECT_DESC state_obj_desc{};
     const IID so_iid = __uuidof(ID3D12StateObject);

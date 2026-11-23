@@ -174,6 +174,8 @@ IUnknown* real_object_behind_proxy(const void* object);
 // (the Xbox slots above, at their configured indices), 56, 61, 62, 67, 70, 74, 76, 86, 101, 108, 127 and 133. Slot 10
 // is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
 // CreateCommandAllocator, which the proxy handles for the allocator proxy.
+// LOCAL STAND-IN (boot-chain test, not for upstream): 55 too, the console CreateDerivedPipelineState, refused with
+// E_NOTIMPL and never forwarded to the PC CreateReservedResource1.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object

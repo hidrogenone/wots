@@ -264,6 +264,7 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 48: return "Xbox CreateCommandQueueX (32-byte desc) -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+        case 55: return "Xbox CreateDerivedPipelineState, refused (LOCAL STAND-IN)";
         case 56: return "GetResourceAllocationInfo1 (C or PC form)";
         case 61: return "Xbox CreateSamplerX -> PC CreateSampler";
         case 62: return "Xbox CreateComputePipelineState";
@@ -3000,6 +3001,22 @@ std::uint64_t proxy_slot74(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3)
     return hr_to_u64(S_OK);
 }
 
+// LOCAL STAND-IN (boot-chain test, not for upstream): the console slot 55 is CreateDerivedPipelineState(base PSO, n,
+// records, riid, ppv), five words. That shape is upstream pull request 7759's reading of the title's call site (the
+// pull request serves the slot and is not on this branch); no run on this branch has reached the call yet. Forwarded
+// by number it reaches the PC slot 55, CreateReservedResource1, whose six words end in an output pointer the title
+// never passed. The call is refused instead: only ppv is nulled, the PC device is not called and no sixth word is
+// read. The line carries the call count and is written for calls 1, 2, 4, 8 and so on.
+HRESULT proxy_slot55_refused(void** out) {
+    static std::atomic<std::uint64_t> calls{0};
+    const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((call & (call - 1)) == 0)
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 55 (console CreateDerivedPipelineState) refused with E_NOTIMPL, "
+                             "call %llu\n", static_cast<unsigned long long>(call));
+    if (out) *out = nullptr;
+    return E_NOTIMPL;
+}
+
 // Xbox slot 86: CreatePipelineState(desc, riid, out), forwarded to PC ID3D12Device2::CreatePipelineState (PC slot 47).
 HRESULT proxy_create_pipeline_state(DeviceProxy* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const IID* riid,
                                     void** out) {
@@ -3122,6 +3139,9 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         std::uint64_t routed = 0;
         if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;  // an override moved a route here
         return proxy_slot74(a1, a2, a3);
+    } else if constexpr (Slot == 55) {  // LOCAL STAND-IN (boot-chain test, not for upstream)
+        note_slot(Slot);
+        return hr_to_u64(proxy_slot55_refused(reinterpret_cast<void**>(a5)));
     } else if constexpr (Slot == 75) {
         return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
                                                      reinterpret_cast<void**>(a4)));
@@ -3536,7 +3556,8 @@ bool device_slot_overridden(unsigned slot) {
         slot == 26 || slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 ||
         slot == 46 || slot == 50 || slot == 56 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 ||
         slot == 75 || slot == 76 || slot == 86 || slot == 101 || slot == 108 ||
-        slot == kCreateCommittedResource3X || slot == 133)
+        slot == kCreateCommittedResource3X || slot == 133 ||
+        slot == 55)  // LOCAL STAND-IN (boot-chain test, not for upstream)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
