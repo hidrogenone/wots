@@ -3161,6 +3161,25 @@ public:
     // With `ms` (a pipeline state stream's MS subobject) it is an MS (+ PS) pipeline on VK_EXT_mesh_shader instead:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
+    // LEONIDA_STUB_PIPELINES=1 (diagnostic): a pipeline whose translated shader is missing is created without a
+    // Vulkan pipeline. It is never registered, so SetPipelineState leaves no PSO bound and its draws and dispatches
+    // are recorded as no-ops (D3D-482). No game shader runs; the boot gets past a title that refuses to go on when
+    // pipeline creation fails.
+    static bool stub_pipelines() {
+        wchar_t v[8] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", v, 8);
+        return n > 0 && n < 8 && v[0] != L'0';
+    }
+    HRESULT stub_or(HRESULT hr, const char* what) {
+        if (!stub_pipelines()) return hr;
+        static std::atomic<unsigned> stubbed{0};
+        const unsigned n = ++stubbed;
+        if (n == 1 || (n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_STUB_PIPELINES: %s pipeline without a translated shader is a "
+                                 "no-op stub (%u so far)\n", what, n);
+        return S_OK;
+    }
+
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
                             const D3D12_SHADER_BYTECODE* as = nullptr) {
         auto& vk = device_.context->vk;
@@ -3257,7 +3276,7 @@ public:
             return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
-        if (!library) return E_FAIL;
+        if (!library) return stub_or(E_FAIL, "graphics");
 
         struct Stage {
             const char* name;
@@ -3311,7 +3330,7 @@ public:
             });
             if (!stage.entry) {
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
-                return E_INVALIDARG;
+                return stub_or(E_INVALIDARG, "graphics");
             }
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
@@ -3770,7 +3789,7 @@ public:
             return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
-        if (!library) return E_FAIL;
+        if (!library) return stub_or(E_FAIL, "compute");
         // A binding-free entry wins over one with bindings for the same program (pick_entry).
         // An FSPX program from a container is matched on its kind-0 state too; a bare kind-6 program whose
         // translations differ is ambiguous without that state and is refused (program_candidates).
@@ -3779,14 +3798,16 @@ public:
                                                        [](const leonida::ShaderEntry&) { return true; });
         if (!entry) {
             const bool fspx = program.kind == leonida::ComputeProgram::Kind::fspx;
-            if (ambiguous)
+            if (ambiguous) {
+                // Ambiguous is not missing: translations exist, so it is refused even with LEONIDA_STUB_PIPELINES.
                 std::fprintf(stderr, "[rt] d3d12: FSPX kind-6 program sha256 %s is ambiguous without its kind-0 "
                                      "state: its translations differ\n", leonida::sha256_hex(program.bytes).c_str());
-            else
-                std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
-                             fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
-                             leonida::sha256_hex(program.bytes).c_str());
-            return E_INVALIDARG;
+                return E_INVALIDARG;
+            }
+            std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
+                         fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
+                         leonida::sha256_hex(program.bytes).c_str());
+            return stub_or(E_INVALIDARG, "compute");
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
         // shader declares bindings has it in its layout and has it bound at every dispatch.
