@@ -102,6 +102,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+
+namespace leonida {
+class FrameTokenSource;
+}
 
 namespace rt::d3d12_xs {
 
@@ -172,6 +177,8 @@ ID3D12Device* device_proxy_real_device(const void* device);
 // console command-list proxy, which joins proxy_real_object), or null when `object` is none of them. For code outside
 // this file that is handed a title's object, like the XboxBvhBuilder shim's command lists.
 IUnknown* real_object_behind_proxy(const void* object);
+
+std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 25/26 (the
