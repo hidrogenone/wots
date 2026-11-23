@@ -109,6 +109,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/winhttp_offline.cpp
     shims/ws2_32_offline.cpp
     shims/xmem.cpp
+    shims/xmem_physical.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
@@ -217,6 +218,19 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
+
+  # xmem.dll's physical pages (XMemAllocatePhysicalPages and the map/free calls), the 64 KiB-page reservations they
+  # are mapped into and the title's VirtualFree, through the registry as a title calls them.
+  add_executable(xmem_physical_test
+    test/xmem_physical_test.cpp
+    shims/xmem.cpp
+    shims/xmem_physical.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xmem_physical_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xmem_physical_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xmem_physical_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xmem_physical_test PRIVATE /OPT:NOREF)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -1060,6 +1074,10 @@ if(BUILD_TESTING)
     # The same checks through the aligned-reservation fallback the shim uses where VirtualAlloc2 is missing.
     add_test(NAME xmem_probe COMMAND xmem_test)
     set_tests_properties(xmem_probe PROPERTIES ENVIRONMENT "LEONIDA_XMEM_NO_VIRTUALALLOC2=1")
+  endif()
+  if(WIN32 AND TARGET xmem_physical_test)
+    add_test(NAME xmem_physical COMMAND xmem_physical_test)
+    set_tests_properties(xmem_physical PROPERTIES TIMEOUT 60)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)

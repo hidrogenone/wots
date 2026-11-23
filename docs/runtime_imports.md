@@ -144,6 +144,39 @@ functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo
 host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
 which opens none.
 
+### Physical pages
+
+Those reserve-only 64 KiB-page ranges are where the title maps physical pages. The executable imports
+`XMemAllocatePhysicalPages`, `XMemFreePhysicalPages`, `XMemMapPhysicalPages` and `XMemMapPhysicalPagesScatter`, and
+asserts at startup when the first allocation fails. Its call sites show the Win32 AWE shapes without the process
+handle, plus an attribute word (`0x180`, `0x280` and `0x380` measured):
+
+| Export | Shape | What the callers check |
+|---|---|---|
+| `XMemAllocatePhysicalPages` | `BOOL (ULONG64 attributes, ULONG_PTR* count, ULONG_PTR* page_array)`, count in 64 KiB pages | `TRUE`, and the count written back unchanged |
+| `XMemFreePhysicalPages` | `BOOL (ULONG_PTR count, ULONG_PTR* page_array)`, count by value | nothing |
+| `XMemMapPhysicalPages` | `PVOID (PVOID va, ULONG_PTR count, ULONG_PTR* page_array)`; a null array unmaps | non-null (64-bit test) |
+| `XMemMapPhysicalPagesScatter` | `BOOL (PVOID* va_array, ULONG_PTR count, ULONG_PTR* page_array)`; null array or 0 entries unmap | nothing |
+
+A page-array entry is opaque to the title except at one call site, which rebuilds it as a 64 KiB page index times 16,
+masked to 25 bits. The shim's entries are therefore 4 KiB frame numbers of 64 KiB pages, `(slot + 1) * 16`.
+
+The host only has user-mode physical pages through AWE, which needs `SeLockMemoryPrivilege` and cannot map one page
+at two addresses. The console can, and the title's two 24 GiB reservations differ only in their attribute word and CPU
+protection. So `runtime/shims/xmem_physical.cpp` makes each page a 64 KiB slot of a pagefile-backed section. A
+reserve-only `MEM_RESERVE | 0x20400000` range is a placeholder reservation (`VirtualAlloc2` with
+`MEM_RESERVE_PLACEHOLDER`). Mapping a page splits it out and replaces it with a view of the slot (`MapViewOfFile3` with
+`MEM_REPLACE_PLACEHOLDER`), and unmapping puts the placeholder back. Every view of a page sees the same bytes and has
+its range's CPU protection; the `PAGE_GRAPHICS_*` bits are dropped. New pages read as zero, and a freed page is zeroed
+before it is handed out again. Freeing a page unmaps it everywhere, as `FreeUserPhysicalPages` does. The title's
+`VirtualFree(base, 0, MEM_RELEASE)` of such a range is shimmed, because the host's would release only its first
+placeholder.
+
+Not done: the GPU side (the D3D12 layer does not see these pages yet; [#5381](https://github.com/ItsNotRexed/Leonida/pull/5381)
+has a device-local half for the same mechanism), and committing ordinary memory inside a physical range, which fails
+with `ERROR_INVALID_ADDRESS` as on Win32. Each mapped page is a view of its own, so a large mapping is many views.
+`xmem_physical_test` covers the shapes above with synthetic pages.
+
 ## Console paths and the write overlay
 
 A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file inside the installed game folder.
