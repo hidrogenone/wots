@@ -72,8 +72,18 @@ const E_UNEXPECTED: HRESULT = 0x8000_FFFF_u32 as i32;
 /// XApuDequeueResult: no result waiting
 const XAPU_NO_RESULTS: HRESULT = 0x8AC8_1001_u32 as i32;
 
-/// one audio frame: 128 samples at 48 kHz
+/// one audio frame: 128 samples at 48 kHz — exactly 1/375 s. FRAME is the
+/// approximate duration used for the catch-up floor; deadlines are computed
+/// exactly per frame index so the cadence does not drift.
 const FRAME: Duration = Duration::from_micros(2667);
+/// frames that may be made up for when the title pops late
+const FRAME_CATCHUP: u32 = 8;
+
+/// Deadline of frame `k` (1-based) after `epoch`: `epoch + k/375 s`, computed in
+/// integer nanoseconds so consecutive frames never accumulate rounding error.
+fn frame_deadline(epoch: Instant, k: u64) -> Instant {
+    epoch + Duration::from_nanos(((k as u128 * 1_000_000_000) / 375) as u64)
+}
 
 // ---------------------------------------------------------------------------------------
 // XCL_TRACE_APU=1: what the title sends the audio processor and the decoder
@@ -493,13 +503,17 @@ pub const MSG_DISCONNECTED: u32 = 0x80;
 pub struct Channel {
     messages: VecDeque<Message>,
     connected: bool,
-    next_frame: Option<Instant>,
+    /// `connect()` instant; frame `k` is due at `frame_deadline(epoch, k)`
+    epoch: Option<Instant>,
+    /// 1-based index of the next audio frame
+    next_frame: u64,
 }
 
 impl Channel {
     pub fn connect(&mut self, now: Instant) {
         self.connected = true;
-        self.next_frame = Some(now + FRAME);
+        self.epoch = Some(now);
+        self.next_frame = 1;
     }
 
     pub fn disconnect(&mut self) {
@@ -519,7 +533,8 @@ impl Channel {
     }
 
     fn frame_due(&self, now: Instant) -> bool {
-        self.connected && self.next_frame.is_some_and(|t| now >= t)
+        self.connected
+            && self.epoch.is_some_and(|e| now >= frame_deadline(e, self.next_frame))
     }
 
     /// The next message: queued ones first, else an audio frame when one is due (a frame
@@ -529,11 +544,14 @@ impl Channel {
             return Some(m);
         }
         if self.frame_due(now) {
-            let t = self.next_frame.unwrap_or(now) + FRAME;
-            self.next_frame = Some(match now.checked_sub(FRAME * 8) {
-                Some(floor) => t.max(floor),
-                None => t,
-            });
+            self.next_frame += 1;
+            // More than FRAME_CATCHUP frames late: resume the schedule about that far
+            // back instead of making up every missed frame.
+            if let (Some(e), Some(floor)) = (self.epoch, now.checked_sub(FRAME * FRAME_CATCHUP)) {
+                let wait = floor.saturating_duration_since(e);
+                let idx = (wait.as_nanos() * 375 + 999_999_999) / 1_000_000_000;
+                self.next_frame = self.next_frame.max(idx as u64);
+            }
             return Some(Message { kind: MSG_AUDIO_FRAME, ..Default::default() });
         }
         None
@@ -1135,6 +1153,20 @@ mod tests {
         assert_eq!(c.pop(later).map(|m| m.kind), Some(MSG_AUDIO_FRAME));
         c.disconnect();
         assert_eq!(c.pop(later).map(|m| m.kind), Some(MSG_DISCONNECTED));
+    }
+
+    #[test]
+    fn frames_stay_on_the_48k_grid_without_drift() {
+        // 375 frames of 128 samples at 48 kHz are exactly 1 s; the old code added
+        // 2667 µs per frame and drifted +0.333 µs each (+125 ppm).
+        let t0 = Instant::now();
+        let mut c = Channel::default();
+        c.connect(t0);
+        for k in 1..=375u64 {
+            let exact = t0 + Duration::from_nanos(((k as u128 * 1_000_000_000) / 375) as u64);
+            assert_eq!(c.pop(exact - Duration::from_nanos(1)), None, "frame {k} early");
+            assert_eq!(c.pop(exact).map(|m| m.kind), Some(MSG_AUDIO_FRAME), "frame {k}");
+        }
     }
 
     #[test]
