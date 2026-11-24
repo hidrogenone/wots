@@ -3,10 +3,11 @@
 WOTS collects our working builds of two projects that run Xbox Series X|S games natively on PC:
 
 - **`xcl` branch:** XCL, an Xbox Series X|S → Windows compatibility layer. Retail games already run.
-- **`leonida` branch:** Leonida, the native PC recompilation of the Xbox version of GTA VI. The tooling
-  is far along, but the game does not boot yet.
+- **`leonida-boot` branch:** Leonida, the native PC recompilation of the Xbox version of GTA VI, with our
+  newest boot work. The tooling is far along, but the game does not boot yet. **`leonida`** has the same
+  project with only the merged pull requests.
 
-Both need the same kinds of help. Below is what developers from our Discord can pick up, and which
+Both need the same kinds of help. Below is what developers from our Discord (https://discord.gg/j3rmDxw5G) can pick up, and which
 channel to talk about it in.
 
 ## Where you can help
