@@ -977,6 +977,19 @@ struct DeviceState {
         return VK_SAMPLE_COUNT_1_BIT;
     }
 
+    // LOCAL STAND-IN (boot-chain test, not for upstream): whether a B4G4R4A4_UNORM render target is made as an
+    // A1R5G5B5_UNORM_PACK16 image. Measured locally: a title sizes a 2560x1440 one, and an RTX 5080 (driver 621.24)
+    // renders to no 4-4-4-4 format (vulkaninfo: A4R4G4B4 and its three siblings sample and copy only), so the size
+    // came back all ones, as the PC runtime answers on NVIDIA. A1R5G5B5 is the 16-bit format of the same
+    // compatibility class that the GPU renders to and blends: the same texel size, copies and footprints, colours to
+    // 5 bits, but one bit of alpha instead of four, and bytes copied out are 1-5-5-5 words. The exact form, an
+    // R16_UINT attachment whose pixel shaders pack the word (upstream pull request 9683 tests it), needs the title's
+    // shaders converted.
+    bool b4g4r4a4_target_as_a1r5g5b5() const {
+        return !color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16) &&
+               color_attachment_usable(VK_FORMAT_A1R5G5B5_UNORM_PACK16);
+    }
+
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
@@ -1058,6 +1071,14 @@ struct DeviceState {
                 backed.uint_backed = srgb;
                 return backed;
             }
+        }
+        // LOCAL STAND-IN (boot-chain test, not for upstream): b4g4r4a4_target_as_a1r5g5b5 above. Only the plain render
+        // target the title asks for: one with unordered access too keeps its format and is refused as before.
+        if (desc.Format == DXGI_FORMAT_B4G4R4A4_UNORM && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+            !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && b4g4r4a4_target_as_a1r5g5b5()) {
+            log_once("B4G4R4A4_UNORM render target unavailable natively, using A1R5G5B5 (local stand-in); format",
+                     desc.Format);
+            return {VK_FORMAT_A1R5G5B5_UNORM_PACK16, VK_IMAGE_ASPECT_COLOR_BIT};
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -3758,6 +3779,10 @@ public:
             graphics_.color_formats[i] = desc.RTVFormats[i] == DXGI_FORMAT_A8_UNORM && device_.info.a8_render_target
                                              ? kA8UnormFormat
                                              : vulkan_format(desc.RTVFormats[i], false).format;
+            // LOCAL STAND-IN (boot-chain test, not for upstream): a B4G4R4A4 render target's attachment has its
+            // image's format (DeviceState::b4g4r4a4_target_as_a1r5g5b5).
+            if (desc.RTVFormats[i] == DXGI_FORMAT_B4G4R4A4_UNORM && device_.b4g4r4a4_target_as_a1r5g5b5())
+                graphics_.color_formats[i] = VK_FORMAT_A1R5G5B5_UNORM_PACK16;
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
@@ -4675,6 +4700,11 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         }
         // An A8 render target is viewed in its own A8 format (Format::a8_as_alpha), other A8 textures through R8.
         named = resource.a8_as_alpha() ? resource_format : texture_storage_format(view.format, false).format;
+        // LOCAL STAND-IN (boot-chain test, not for upstream): a B4G4R4A4 view of a B4G4R4A4 texture is in the image's
+        // format, which is A1R5G5B5 for a render target on a GPU that renders to no 4-4-4-4 format
+        // (DeviceState::b4g4r4a4_target_as_a1r5g5b5) and the same A4R4G4B4 as before for every other one.
+        if (view.format == DXGI_FORMAT_B4G4R4A4_UNORM && desc.Format == DXGI_FORMAT_B4G4R4A4_UNORM)
+            named = resource_format;
         if (g::is_depth_stencil_format(named)) {
             log_once("depth-stencil view format on a colour texture:", int(view.format));
             return false;

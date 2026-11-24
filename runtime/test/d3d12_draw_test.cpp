@@ -969,6 +969,77 @@ int main() {
             }
         }
 
+        // LOCAL STAND-IN (boot-chain test, not for upstream): a B4G4R4A4_UNORM render target where the GPU renders to
+        // no 4-4-4-4 format is an A1R5G5B5 image (DeviceState::b4g4r4a4_target_as_a1r5g5b5 in d3d12_vulkan_device.cpp),
+        // and a pipeline that names B4G4R4A4 as its render-target format draws into it: the full-screen draw's
+        // (0.8, 0.6, 0, 1) lands as the 1-5-5-5 word 0xE660 (A 1, R 25, G 19, B 0). Where the GPU renders to
+        // A4R4G4B4 itself the word is 0xFC90 (A 15, R 12, G 9, B 0).
+        {
+            D3D12_RESOURCE_DESC p4_desc = rt_desc;
+            p4_desc.Width = p4_desc.Height = 4;
+            p4_desc.Format = DXGI_FORMAT_B4G4R4A4_UNORM;
+            Ref<ID3D12Resource> p4_target;
+            if (FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &p4_desc,
+                                                       D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                       IID_PPV_ARGS(&p4_target.p)))) {
+                std::printf("B4G4R4A4_UNORM render target: not supported on this device\n");
+            } else {
+                VkFormatProperties p4_native{};
+                d.instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(
+                    d.physical, VK_FORMAT_A4R4G4B4_UNORM_PACK16, &p4_native);
+                const std::uint16_t p4_want =
+                    (p4_native.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) ? 0xFC90 : 0xE660;
+                const D3D12_DESCRIPTOR_HEAP_DESC p4_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                                              D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+                Ref<ID3D12DescriptorHeap> p4_heap;
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&p4_heap_desc, IID_PPV_ARGS(&p4_heap.p))));
+                const D3D12_CPU_DESCRIPTOR_HANDLE p4_rtv{
+                    SIZE_T(reinterpret_cast<XboxHeapHandleFn>(slot(p4_heap.p, 9))(p4_heap.p))};
+                D3D12_RENDER_TARGET_VIEW_DESC p4_view{};
+                p4_view.Format = DXGI_FORMAT_B4G4R4A4_UNORM;
+                p4_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                device->CreateRenderTargetView(p4_target.p, &p4_view, p4_rtv);
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC p4_pso_desc = fullscreen_desc;
+                p4_pso_desc.RTVFormats[0] = DXGI_FORMAT_B4G4R4A4_UNORM;
+                Ref<ID3D12PipelineState> p4_pso;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&p4_pso_desc, IID_PPV_ARGS(&p4_pso.p))));
+                const FLOAT p4_clear[4] = {0, 0, 1, 0};
+                const D3D12_VIEWPORT p4_viewport{0, 0, 4, 4, 0, 1};
+                const D3D12_RECT p4_scissor{0, 0, 4, 4};
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, p4_pso.p)));
+                list->ClearRenderTargetView(p4_rtv, p4_clear, 0, nullptr);
+                list->SetGraphicsRootSignature(root.p);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list->RSSetViewports(1, &p4_viewport);
+                list->RSSetScissorRects(1, &p4_scissor);
+                list->OMSetRenderTargets(1, &p4_rtv, FALSE, nullptr);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 2048);  // the B8G8R8X8 block's tint
+                list->DrawInstanced(3, 1, 0, 0);
+                const auto p4_to_copy = transition(p4_target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &p4_to_copy);
+                D3D12_TEXTURE_COPY_LOCATION p4_dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                p4_dst.PlacedFootprint = {0, {DXGI_FORMAT_B4G4R4A4_UNORM, 4, 4, 1, 256}};
+                D3D12_TEXTURE_COPY_LOCATION p4_src{p4_target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                list->CopyTextureRegion(&p4_dst, 0, 0, 0, &p4_src, nullptr);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                // After the A8 block's 51..56, before the step-rate block's 61.
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, 57)) && SUCCEEDED(fence->SetEventOnCompletion(57, nullptr)));
+                for (UINT y = 0; y < 4; ++y)
+                    for (UINT x = 0; x < 4; ++x) {
+                        std::uint16_t word = 0;
+                        std::memcpy(&word, static_cast<const std::uint8_t*>(mapped) + y * 256 + x * 2, sizeof(word));
+                        if (word == p4_want) continue;
+                        std::fprintf(stderr, "B4G4R4A4 target: texel (%u,%u) got 0x%04x, want 0x%04x\n", x, y, word,
+                                     p4_want);
+                        return 1;
+                    }
+                std::printf("B4G4R4A4_UNORM render target: clear and draw matched as the word 0x%04x\n", p4_want);
+            }
+        }
+
         // Instance step rate > 1 (VK_KHR/EXT_vertex_attribute_divisor): two per-instance colours in slot 1:
         // entry 0 = red, entry 1 = magenta (both preserved by the {1,0,1} tint). With step rate 2:
         // - Draw 1 (top-left, 2 instances from 0): instances 0 and 1 both read entry 0/2 = 0 (red).

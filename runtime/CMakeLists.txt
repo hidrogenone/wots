@@ -1885,6 +1885,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_srgb_uav_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_srgb_uav COMMAND d3d12_srgb_uav_test)
     set_tests_properties(d3d12_srgb_uav PROPERTIES SKIP_RETURN_CODE 77)  # native sRGB storage, no Vulkan GPU, or Wine
+    # LOCAL STAND-IN (boot-chain test, not for upstream): a B4G4R4A4 render target as an A1R5G5B5 image.
+    add_executable(d3d12_b4g4r4a4_target_test test/d3d12_b4g4r4a4_target_test.cpp)
+    target_link_libraries(d3d12_b4g4r4a4_target_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_b4g4r4a4_target_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_b4g4r4a4_target_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_b4g4r4a4_target COMMAND d3d12_b4g4r4a4_target_test)
+    set_tests_properties(d3d12_b4g4r4a4_target PROPERTIES SKIP_RETURN_CODE 77)  # a GPU that renders to A4R4G4B4
     add_executable(d3d12_r9g9b9e5_uav_test test/d3d12_r9g9b9e5_uav_test.cpp)
     target_link_libraries(d3d12_r9g9b9e5_uav_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_r9g9b9e5_uav_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
