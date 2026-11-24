@@ -120,8 +120,10 @@ vectored handler before any image code runs (`src/cpu_emulation.h`): it recognis
 address, does the same work on the thread's context and continues after the instruction. It prints one `[rt] cpu:`
 line at startup naming what the host lacks, and one the first time each instruction is emulated. On a host that has
 them the CPU runs them and the handler never sees them. Each emulated instruction costs an exception round trip, so a
-hot loop of them is slow; patching such a site in place is a later step. `cpu_emulation_test` runs every form for
-real: natively on a Zen host, through the handler on an Intel one.
+hot loop of them is slow. The one such loop a boot reaches, the executable's zeroing loop (`clzero; add rax, 64;
+cmp rax, <reg>; jb`), is finished in the trap of its first `clzero` (`finish_clzero_loop`); patching other sites in
+place is a later step. `cpu_emulation_test` runs every form for real: natively on a Zen host, through the handler on
+an Intel one.
 
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
 reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
